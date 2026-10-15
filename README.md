@@ -76,9 +76,9 @@ Defaults when `SUNSHINE_BASE` is 47989:
 | `SUNSHINE_UDP_OFFSETS` | +9 +10 +11 +13 | UDP 47998, 47999, 48000, 48002 | video, control, audio, and the extra stream port |
 | `SUNSHINE_RTSP_OFFSET` | +21 | TCP 48010 and UDP 48010 | RTSP |
 
-After TLS has identified the client, the source address is stuck to that pod, and only if the pod is on this node. Replies are rewritten back to the client. This is independent of the TLS socket. Two clients behind one NAT share a source address, so UDP follows whichever of them last completed TLS.
+After TLS has identified the client, the source address is stuck to that pod, and only if the pod is on this node. Python sends `map <client-ip> <pod-ip> <user>` to `gs-relay` over a Unix socket and waits until that row is installed. The relay binds the UDP ports and the RTSP TCP port, forwards datagrams, and splices RTSP. Replies from the pod go back to the client that last used that port. A `touch` comes back when bytes move, at most every few seconds, and the proxy still patches activity at most every 30 seconds. This is independent of the TLS socket. Two clients behind one NAT share a source address, so UDP follows whichever of them last completed TLS.
 
-`serverinfo` is answered by the proxy when the seat is down, so a Moonlight poll does not boot a GPU. `applist`, `launch`, and the other HTTPS calls wait until the pod is Ready (labwc's socket), holding the already-finished handshake, but only when the seat is local. Moonlight's own HTTP read timeout is only a few seconds, so a remote placement returns immediately and the first click on the owning proxy starts the seat. The pod stays up across the retry. Budget is `READY_TIMEOUT` (180s) and it applies only to a local ensure.
+`serverinfo` is answered by the proxy when the seat is down, so a Moonlight poll does not boot a GPU. `applist`, `launch`, and the other HTTPS calls wait until the pod is Ready (labwc's socket), holding the already-finished handshake, but only when the seat is local. Moonlight's own HTTP read timeout is only a few seconds, so a remote placement returns immediately and the first click on the owning proxy starts the seat. The pod stays up across the retry. Budget is `READY_TIMEOUT` (900s, long enough for the first layer copy) and it applies only to a local ensure.
 
 ## A connection on the wrong proxy
 
@@ -102,7 +102,7 @@ docker build -f orchestrator/Dockerfile -t gs-orchestrator:local .
 docker save gamestream:local gs-orchestrator:local | sudo ctr -n k8s.io images import -
 ```
 
-Import the seat image on every GPU node. The orchestrator image has to be on the orchestrator's node and on every proxy node. It needs `python3-cryptography`, which the image installs.
+Import the seat image on every GPU node. The orchestrator image has to be on the orchestrator's node and on every proxy node. It needs `python3-cryptography`, plus `rust`, `cargo`, and `gcc`. The proxy role compiles `gs-relay` from `/usr/local/src/gs-relay` on start and installs `/usr/local/bin/gs-relay`. The orchestrator role skips that. The first start is a release build; the proxy `startupProbe` allows five minutes. A later start of the same container filesystem skips the compile when the source stamp matches. `CERT_PROXY=false` does not use the relay. That mode still forwards the whole port span in Python.
 
 ## Apply
 
@@ -128,7 +128,7 @@ The time-slicing ConfigMap is optional and lives in `GPU_OPERATOR_NAMESPACE`. It
 2. The proxy calls the orchestrator with its own node name. If that user's seat is already on this node, the proxy dials the pod IP. No second seat is created.
 3. If the seat is on another node, the browser is sent to that node's proxy with HTTP 307. Moonlight is given that node's address in `serverinfo` and then reset, so its next poll lands there (`HTTP_FOREIGN`, default `redirect`). Nothing is spliced across nodes unless `HTTP_FOREIGN=proxy`.
 4. If no seat exists, the orchestrator creates it on the asking node when a GPU there has room, otherwise on another proxy node. The asking proxy waits for Ready only when the seat is local.
-5. The pod is Ready when labwc's socket exists. HTTPS control is then relayed. UDP and RTSP follow the client address recorded by that TLS session.
+5. The pod is Ready when labwc's socket exists. HTTPS control is then relayed. UDP and RTSP follow the client address recorded by that TLS session. `gs-relay` does that forwarding. Python does not bind those ports.
 6. GPU index is the least loaded of `GPU_COUNT`, ties to the lower index, written to `gamestream.local/gpu` and `NVIDIA_VISIBLE_DEVICES`. With `DEVICE_PLUGIN=true` the plugin's allocation wins if it disagrees. Turn the plugin flag off only if the runtime actually honors that env var. nvkvm-kata on Kubernetes attaches a GPU because of the resource request.
 
 Set `CERT_PROXY=false` to restore the older behavior: one external port span per user, a reset when the seat is on another node, and no certificate routing. Moonlight then has to be aimed at that user's external base.
@@ -141,9 +141,31 @@ Default 600s (`IDLE_SECONDS`) with no proxied bytes. A `serverinfo` poll does no
 
 The orchestrator is the only reaper. It deletes idle seats on every node. A proxy that is carrying the stream patches `gamestream.local/last-activity` (at most every 30 seconds). The seat stays while that annotation is fresh.
 
-That is not a pause. Kata has no API that snapshots a VM, drops GPU memory and RAM, and restores the same processes. Checkpointing through the kubelet would also need `nodes/proxy`, which this ServiceAccount does not have. Delete frees the GPU and the memory. The game process is gone. Files under the home mount, Sunshine's pairing state, and the shared package layer are not.
+That is not a pause. Kata has no API that snapshots a VM, drops GPU memory and RAM, and restores the same processes. Checkpointing through the kubelet would also need `nodes/proxy`, which this ServiceAccount does not have. Delete frees the GPU and the memory. The game process is gone. Files under the home mount, Sunshine's pairing state, the shared package layer, the TPU scratchpad, and the UEFI variable store are not.
 
 A later pause belongs behind `Seats.reap`. Do not widen the Role to get there.
+
+## Secure Boot and the TPU
+
+Seats ask the nvkvm VM for a Secure Boot capable firmware and a TPU emulator. The host side is [deploy/kata/gs_kata_shim.py](deploy/kata/gs_kata_shim.py), installed in front of the nvkvm QEMU shim. [docs/nvkvm-kata.md](docs/nvkvm-kata.md) is the node setup: `edk2-ovmf`, `enable_annotations`, and three lines in `shim.env`.
+
+`KATA_FIRMWARE` is `OVMF_CODE.secboot.fd`. The variable store starts as the empty `KATA_FIRMWARE_VARS` and is then `<PERSIST_ROOT>/<login>/uefi/OVMF_VARS.fd`. Secure Boot is supported and off, so the unsigned guest kernel still boots. Enrolling keys persists across pod delete and will then refuse that kernel. `KATA_SECURE_BOOT=false` skips it.
+
+The TPU is not a Cloud TPU. It is a 1 MiB int8 scratchpad at `/dev/virtio-ports/org.sunslop.tpu`. Its state file is `<PERSIST_ROOT>/<login>/tpu/state.bin` (`TPU_STATE_DIR`), on the same disk as the home directory, and it survives the pod. `TPU_EMULATION=false` skips it. The protocol is in the runtime doc.
+
+## Desktop kernel
+
+A seat is a kata VM. Steam, Proton, and Sunshine need a desktop guest kernel, not the compute fragment nvkvm builds by itself. Before `nvkvm-kata-install.sh`:
+
+```bash
+bash deploy/kata/apply-desktop-kernel.sh /path/to/nvkvm-kata
+```
+
+That splices [deploy/kata/desktop.x86_64.conf](deploy/kata/desktop.x86_64.conf) into `kata/fragments/gpu/nvkvm.x86_64.conf.in` and leaves a copy at `kata/fragments/gpu/desktop.x86_64.conf`. The build reads the spliced file only. Rebuild with `--graphics 1`. The kernel has to be **6.14 or newer** (ntsync). Every option is built-in. The kata rootfs does not contain `/lib/modules` for this kernel, so a module would never show up in the seat. `CONFIG_NTSYNC=m` would be the same as leaving it out.
+
+The fragment asks for uinput (and `INPUT_MISC`, which hides it), evdev, joydev, HID/UHID, ntsync, FUSE passthrough, overlay, squashfs (xz and zstd, multi decompressor), binfmt_misc, userfaultfd, 32-bit emulation, a dummy ALSA card plus the sequencer, EFI variables, transparent hugepages, schedutil uclamp, preempt, and a 1 kHz tick. FUSE and overlay are already in Kata's own fs fragment; they are repeated so this build still requests them. `CONFIG_DRM` stays in nvkvm's graphics fragment. Do not set `CONFIG_MODULE_SIG_FORCE`. That would refuse `nvkvm-guest.ko`. `memfd_create` is not a fragment line: its prompt exists only with `CONFIG_EXPERT`, and turning that on would drop the syscalls Kata does not name. The apply script gives the symbol `default y` and regenerates the config with `olddefconfig` before the kernel compiles.
+
+The node gate fails until `/proc/misc` has `uinput` and `ntsync`, `/proc/filesystems` has squashfs, overlay, and fuse, and `/proc/asound/cards` has the dummy card. uinput is a misc device (major 10). It is not a line in `/proc/devices`. The seat entrypoint bind-mounts `/dev/ntsync`, `/dev/fuse`, `/dev/uhid`, `/dev/snd`, and `/dev/uinput` from a devtmpfs when the container `/dev` does not already have them, creates any that are still missing from `/proc/misc`, chmod's the sound nodes (there is no udev), raises `vm.max_map_count` and the inotify watches, and adds the desktop user to the `audio` group. A pod that is already running does not pick this up. The GPU node has to rebuild the guest kernel. The first seat boot copies `/usr` into the shared layer, so `READY_TIMEOUT` is 900 seconds.
 
 ## Package layer
 
@@ -181,6 +203,9 @@ python3 deploy/render.py --seat
 python3 orchestrator/moonlight_proxy.py
 python3 orchestrator/orchestrator.py --self-test
 python3 image/seat-boot.py --self-test
+python3 deploy/kata/gs_kata_shim.py --self-test
+bash deploy/kata/apply-desktop-kernel.sh --self-test
+cargo test --offline --manifest-path orchestrator/gs-relay/Cargo.toml
 ```
 
 ## Layout
@@ -188,7 +213,8 @@ python3 image/seat-boot.py --self-test
 | Path | Role |
 |---|---|
 | [orchestrator/orchestrator.py](orchestrator/orchestrator.py) | seats, placement, Selkies login, idle, orchestrator API |
-| [orchestrator/moonlight_proxy.py](orchestrator/moonlight_proxy.py) | Sunshine TLS, pairing, UDP, `/admin`, shared cert |
+| [orchestrator/moonlight_proxy.py](orchestrator/moonlight_proxy.py) | Sunshine TLS, pairing, `/admin`, shared cert, relay control |
+| [orchestrator/gs-relay](orchestrator/gs-relay) | UDP and RTSP data plane, compiled on the proxy at start |
 | [deploy/gs-config.yaml](deploy/gs-config.yaml) | site paths, account, ports, images |
 | [deploy/render.py](deploy/render.py) | copies the ConfigMap into the other manifests |
 | [deploy/orchestrator.yaml](deploy/orchestrator.yaml) | Deployment, RBAC, users, cookie Secret |
@@ -196,4 +222,6 @@ python3 image/seat-boot.py --self-test
 | [image/](image) | seat image: labwc, Sunshine, Selkies, package layer, seat-boot |
 | [deploy/seat-direct.yaml](deploy/seat-direct.yaml) | one pod, no orchestrator |
 | [deploy/time-slicing.yaml](deploy/time-slicing.yaml) | shares per GPU |
+| [deploy/kata/gs_kata_shim.py](deploy/kata/gs_kata_shim.py) | Secure Boot pflash and the TPU emulator, in front of the nvkvm QEMU shim |
+| [deploy/kata/desktop.x86_64.conf](deploy/kata/desktop.x86_64.conf) | guest kernel fragment: uinput, ntsync, squashfs, 32-bit, dummy sound |
 | [docs/nvkvm-kata.md](docs/nvkvm-kata.md) | GPU-node runtime gate |

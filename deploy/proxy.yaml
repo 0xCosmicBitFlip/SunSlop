@@ -5,7 +5,10 @@
 #
 # Moonlight that lands here while the seat is on another node is told that
 # node's address, then reset so it retries there. Selkies is redirected
-# (HTTP 307) unless HTTP_FOREIGN says otherwise. Apply with:
+# (HTTP 307) unless HTTP_FOREIGN says otherwise.
+#
+# On start the container compiles gs-relay (UDP and RTSP) before Python
+# listens. startupProbe covers that first release build. Apply with:
 #   python3 deploy/render.py | kubectl apply -f -
 apiVersion: v1
 kind: ServiceAccount
@@ -80,11 +83,16 @@ spec:
                 secretKeyRef:
                   name: gs-cookie
                   key: admin.password
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: ${HTTP_PORT}
+            periodSeconds: 5
+            failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /healthz
               port: ${HTTP_PORT}
-            initialDelaySeconds: 2
             periodSeconds: 10
           volumeMounts:
             - name: users

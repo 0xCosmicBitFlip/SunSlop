@@ -18,7 +18,8 @@ LocalIP and ExternalIP inside serverinfo. `HTTP_FOREIGN=redirect` (the
 default) answers one serverinfo with the owning proxy's address, then RSTs
 so the next poll fails here and succeeds there. `HTTP_FOREIGN=reset` RSTs
 immediately. UDP and RTSP have no redirect; they arrive only after the
-client has moved.
+client has moved. Those two are not forwarded here. `gs-relay` owns the
+sockets. This process tells it which pod a client address belongs to.
 """
 
 import hmac
@@ -28,6 +29,7 @@ import re
 import secrets
 import socket
 import ssl
+import subprocess
 import threading
 import time
 import uuid
@@ -641,35 +643,6 @@ def _request(ssock, path):
     return status, parse_xml(body.decode("utf-8", "replace"))
 
 
-def splice(left, right, touch):
-    stop = threading.Event()
-
-    def pump(src, dst):
-        try:
-            while not stop.is_set():
-                data = src.recv(65536)
-                if not data:
-                    break
-                touch()
-                dst.sendall(data)
-        except OSError:
-            pass
-        finally:
-            stop.set()
-            for sock, how in ((src, socket.SHUT_RD), (dst, socket.SHUT_WR)):
-                try:
-                    sock.shutdown(how)
-                except OSError:
-                    pass
-
-    a = threading.Thread(target=pump, args=(left, right), daemon=True)
-    b = threading.Thread(target=pump, args=(right, left), daemon=True)
-    a.start()
-    b.start()
-    a.join()
-    b.join()
-
-
 def read_http(sock, buf):
     while b"\r\n\r\n" not in buf:
         chunk = sock.recv(65536)
@@ -872,6 +845,254 @@ def rewrite_backend_response(raw, host, uniqueid):
     return b"\r\n".join(lines) + b"\r\n\r\n" + new_body
 
 
+def relay_ipv4(value):
+    parts = (value or "").split(".")
+    if len(parts) != 4:
+        return ""
+    try:
+        nums = [int(part) for part in parts]
+    except ValueError:
+        return ""
+    if any(num < 0 or num > 255 for num in nums):
+        return ""
+    if any(part != str(num) for part, num in zip(parts, nums)):
+        return ""
+    return ".".join(str(num) for num in nums)
+
+
+def relay_user(value):
+    if not value or len(value) > 64:
+        return ""
+    if any(ch.isspace() or ord(ch) < 32 for ch in value):
+        return ""
+    return value
+
+
+def _relay_sources(root):
+    newest = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name != "target"]
+        for name in filenames:
+            if name.endswith((".rs", ".toml", ".lock")):
+                newest = max(newest, os.path.getmtime(os.path.join(dirpath, name)))
+    return newest
+
+
+def relay_source_dir():
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gs-relay")
+    packaged = "/usr/local/src/gs-relay"
+    for path in (here, packaged):
+        if os.path.isfile(os.path.join(path, "Cargo.toml")):
+            return path
+    return ""
+
+
+def ensure_relay_binary():
+    """The binary the proxy will exec. Pods compile it before this process."""
+    override = os.environ.get("GS_RELAY_BIN", "").strip()
+    if override:
+        if not os.path.isfile(override) or not os.access(override, os.X_OK):
+            raise SystemExit(f"GS_RELAY_BIN is not executable: {override}")
+        return override
+    installed = "/usr/local/bin/gs-relay"
+    if os.path.isfile(installed) and os.access(installed, os.X_OK):
+        return installed
+    src = relay_source_dir()
+    built = os.path.join(src, "target", "release", "gs-relay") if src else ""
+    if built and os.path.isfile(built) and os.access(built, os.X_OK):
+        if _relay_sources(src) <= os.path.getmtime(built):
+            return built
+    if not src or not shutil_which("cargo"):
+        raise SystemExit("gs-relay is not built; the proxy compiles it on start")
+    log(f"compiling gs-relay in {src}")
+    subprocess.check_call(
+        ["cargo", "build", "--release", "--offline", "--locked"],
+        cwd=src,
+    )
+    if not os.path.isfile(built):
+        raise SystemExit("gs-relay compile did not produce a binary")
+    return built
+
+
+def shutil_which(name):
+    path = os.environ.get("PATH", "")
+    for directory in path.split(os.pathsep):
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return ""
+
+
+class RustRelay:
+    """Child process that owns the UDP sockets and the RTSP splice.
+
+    `map` is the only thing Python has to say: this client address goes to
+    that pod. `touch` comes back when forwarded bytes should keep the seat.
+    """
+
+    def __init__(self, ports, rtsp_wait, touch, bind="0.0.0.0"):
+        self.ports = ports
+        self.rtsp_wait = int(rtsp_wait)
+        self.touch = touch
+        self.bind = bind
+        self.proc = None
+        self.sock = None
+        self._write_lock = threading.Lock()
+        self._map_mu = threading.Lock()
+        self._ack = threading.Event()
+        self._stopping = False
+        self._dir = ""
+
+    def start(self):
+        binary = ensure_relay_binary()
+        self._dir = tempfile_dir()
+        path = os.path.join(self._dir, "control.sock")
+        udp = ",".join(str(port) for port in self.ports["udp"])
+        cmd = [
+            binary,
+            "--control", path,
+            "--udp", udp,
+            "--rtsp", str(self.ports["rtsp"]),
+            "--rtsp-wait", str(self.rtsp_wait),
+            "--bind", self.bind,
+        ]
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+        try:
+            self._connect(path)
+        except BaseException:
+            self._stopping = True
+            self._kill()
+            raise
+        threading.Thread(target=self._read, name="gs-relay-read", daemon=True).start()
+        threading.Thread(target=self._watch, name="gs-relay-watch", daemon=True).start()
+
+    def _connect(self, path):
+        deadline = time.time() + 10
+        last = "did not listen"
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                raise SystemExit(f"gs-relay exited {self.proc.returncode}")
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.connect(path)
+            except OSError as exc:
+                last = str(exc)
+                time.sleep(0.05)
+                continue
+            sock.settimeout(5)
+            buf = b""
+            try:
+                while b"\n" not in buf:
+                    chunk = sock.recv(128)
+                    if not chunk:
+                        break
+                    buf += chunk
+            except OSError as exc:
+                last = str(exc)
+                sock.close()
+                time.sleep(0.05)
+                continue
+            if not buf.startswith(b"ready\n") and buf.strip() != b"ready":
+                sock.close()
+                raise SystemExit(f"gs-relay handshake {buf!r}")
+            sock.settimeout(None)
+            self.sock = sock
+            return
+        raise SystemExit(f"gs-relay control socket: {last}")
+
+    def _watch(self):
+        code = self.proc.wait()
+        if self._stopping:
+            return
+        log(f"gs-relay exited {code}")
+        os._exit(1)
+
+    def _read(self):
+        buf = b""
+        while not self._stopping:
+            try:
+                chunk = self.sock.recv(4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                self._event(line.decode("utf-8", "replace").strip())
+
+    def _event(self, line):
+        if line == "ok":
+            self._ack.set()
+            return
+        if line.startswith("touch "):
+            user = relay_user(line[6:])
+            if not user:
+                return
+            try:
+                self.touch(user)
+            except Exception as exc:
+                log(f"touch {user}: {exc}")
+        elif line.startswith("log "):
+            log(line[4:])
+
+    def map(self, client_ip, pod_ip, user):
+        client = relay_ipv4(client_ip)
+        pod = relay_ipv4(pod_ip)
+        name = relay_user(user)
+        if not client or not pod or not name:
+            log(f"gs-relay map rejected client={client_ip!r} pod={pod_ip!r} user={user!r}")
+            return
+        # The old in-process dict was visible to UDP as soon as _remember
+        # returned. Wait until the relay has installed the same row.
+        with self._map_mu:
+            self._ack.clear()
+            self._send(f"map {client} {pod} {name}\n")
+            if not self._ack.wait(2):
+                log(f"gs-relay did not acknowledge map for {client}")
+
+    def _send(self, text):
+        data = text.encode()
+        with self._write_lock:
+            sock = self.sock
+            if sock is None:
+                return
+            try:
+                sock.sendall(data)
+            except OSError as exc:
+                log(f"gs-relay map: {exc}")
+
+    def _kill(self):
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1)
+
+    def stop(self):
+        self._stopping = True
+        self._kill()
+        sock = self.sock
+        self.sock = None
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        if self._dir:
+            import shutil
+            shutil.rmtree(self._dir, ignore_errors=True)
+            self._dir = ""
+
+
+def tempfile_dir():
+    import tempfile
+    return tempfile.mkdtemp(prefix="gs-relay-")
+
+
 class MoonlightProxy:
     def __init__(self, cfg, directory, seats):
         self.cfg = cfg
@@ -888,7 +1109,6 @@ class MoonlightProxy:
         )
         self.pairs = PairServer(self.store)
         self.by_ip = {}
-        self.by_flow = {}
         self._pointed = set()
         self._map_lock = threading.Lock()
         self._stop = threading.Event()
@@ -928,11 +1148,16 @@ class MoonlightProxy:
                 log(f"trusting {len(pems)} moonlight client certificate(s)")
 
     def start(self):
+        wait = max(30, int(getattr(self.cfg, "ready_timeout", 30) or 30))
+        bind = getattr(self.cfg, "relay_bind", "") or "0.0.0.0"
+        self.relay = RustRelay(self.ports, wait, self.seats.touch, bind=bind)
+        self.relay.start()
         threading.Thread(target=self._tls_loop, name="moon-tls", daemon=True).start()
-        threading.Thread(target=self._udp_loop, name="moon-udp", daemon=True).start()
         threading.Thread(target=self._game_http_loop, name="moon-http", daemon=True).start()
-        threading.Thread(target=self._plain_loop, args=(self.ports["rtsp"],), name="moon-rtsp", daemon=True).start()
-        log(f"tls :{self.ports['https']}, http :{self.ports['http']}, rtsp :{self.ports['rtsp']}, udp {self.ports['udp']}")
+        log(
+            f"tls :{self.ports['https']}, http :{self.ports['http']}, "
+            f"rtsp :{self.ports['rtsp']}, udp {self.ports['udp']} (gs-relay)"
+        )
 
     def serve(self):
         self.start()
@@ -941,6 +1166,9 @@ class MoonlightProxy:
     def _remember(self, client_ip, pod_ip, gsuser, touch=True):
         with self._map_lock:
             self.by_ip[client_ip] = {"pod": pod_ip, "user": gsuser, "when": time.time()}
+        relay = getattr(self, "relay", None)
+        if relay is not None:
+            relay.map(client_ip, pod_ip, gsuser)
         if touch:
             self.seats.touch(gsuser)
 
@@ -1134,47 +1362,6 @@ class MoonlightProxy:
             log(f"{gsuser}: backend tls {exc}")
             return None
 
-    def _udp_loop(self):
-        socks = []
-        for port in self.ports["udp"]:
-            sock = self._bind(socket.SOCK_DGRAM, port)
-            sock.settimeout(1.0)
-            socks.append((port, sock))
-        while not self._stop.is_set():
-            for port, sock in socks:
-                try:
-                    data, who = sock.recvfrom(65535)
-                except socket.timeout:
-                    continue
-                except OSError:
-                    continue
-                self._udp(sock, port, data, who)
-
-    def _udp(self, sock, port, data, who):
-        with self._map_lock:
-            flow = self.by_flow.get((who[0], port))
-        if flow and who[0] == flow.get("pod"):
-            client = flow.get("client")
-            if client:
-                try:
-                    sock.sendto(data, client)
-                    self.seats.touch(flow["user"])
-                except OSError:
-                    pass
-            return
-        mapped = self._lookup_ip(who[0])
-        if not mapped:
-            return
-        with self._map_lock:
-            self.by_flow[(mapped["pod"], port)] = {
-                "pod": mapped["pod"], "client": who, "user": mapped["user"],
-            }
-        try:
-            sock.sendto(data, (mapped["pod"], port))
-            self.seats.touch(mapped["user"])
-        except OSError as exc:
-            log(f"udp {port}: {exc}")
-
     def _game_http_loop(self):
         listen = self._bind(socket.SOCK_STREAM, self.ports["http"])
         listen.listen(64)
@@ -1243,45 +1430,6 @@ class MoonlightProxy:
         def save(data):
             data["clients"] = [c for c in data["clients"] if c.get("uuid") != uid]
         self.store.update(save)
-
-    def _plain_loop(self, port):
-        listen = self._bind(socket.SOCK_STREAM, port)
-        listen.listen(64)
-        listen.settimeout(1.0)
-        while not self._stop.is_set():
-            try:
-                conn, addr = listen.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                continue
-            threading.Thread(target=self._plain, args=(conn, addr, port), daemon=True).start()
-
-    def _plain(self, conn, addr, port):
-        back = None
-        try:
-            deadline = time.time() + max(30, self.cfg.ready_timeout)
-            mapped = None
-            while time.time() < deadline:
-                mapped = self._lookup_ip(addr[0])
-                if mapped:
-                    break
-                time.sleep(0.2)
-            if not mapped:
-                return
-            back = socket.create_connection((mapped["pod"], port), timeout=10)
-            self.seats.touch(mapped["user"])
-            splice(conn, back, lambda: self.seats.touch(mapped["user"]))
-        except OSError as exc:
-            log(f"tcp {port}: {exc}")
-        finally:
-            for sock in (conn, back):
-                if sock is None:
-                    continue
-                try:
-                    sock.close()
-                except OSError:
-                    pass
 
     def handle_admin(self, handler):
         path = urllib.parse.urlsplit(handler.path).path
@@ -1552,9 +1700,170 @@ def self_test():
     assert safe_host("5.5.5.5:47984") == "5.5.5.5"
     assert safe_host("[2001:db8::1]:47984") == "[2001:db8::1]"
     assert safe_host("bad host") == ""
+    _relay_test()
     _loopback()
     _flow_test()
     print("moonlight self-test ok")
+
+
+def _relay_test():
+    """UDP return path and the RTSP splice, through the same control socket.
+
+    The relay listens on 127.0.0.4, not 127.0.0.1. A local HTTP probe talks
+    to localhost and would otherwise be spliced as if it were the client.
+    """
+    udp_port, rtsp_port = _free_pair()
+    touches = []
+    relay = RustRelay(
+        {"udp": (udp_port,), "rtsp": rtsp_port},
+        rtsp_wait=1,
+        touch=lambda name: touches.append(name),
+        bind="127.0.0.4",
+    )
+    relay.start()
+    client = other = stranger = pod = closed = None
+    try:
+        pod = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        pod.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        pod.bind(("127.0.0.2", udp_port))
+        echo_ready = threading.Event()
+        echo_box = {}
+
+        def echo():
+            listen = socket.socket()
+            listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listen.bind(("127.0.0.2", rtsp_port))
+            listen.listen(4)
+            echo_ready.set()
+            try:
+                conn, _addr = listen.accept()
+                conn.settimeout(3)
+                try:
+                    data = b""
+                    while len(data) < 7:
+                        chunk = conn.recv(32)
+                        if not chunk:
+                            break
+                        data += chunk
+                    echo_box["got"] = data
+                    conn.sendall(b"RTSP/1.0 200")
+                finally:
+                    conn.close()
+            finally:
+                listen.close()
+
+        threading.Thread(target=echo, daemon=True).start()
+        assert echo_ready.wait(2)
+
+        client_box = {}
+
+        def rtsp_client():
+            sock = socket.socket()
+            try:
+                sock.bind(("127.0.0.3", 0))
+                sock.settimeout(3)
+                sock.connect(("127.0.0.4", rtsp_port))
+                sock.sendall(b"OPTIONS")
+                client_box["reply"] = sock.recv(32)
+            except OSError as exc:
+                client_box["err"] = exc
+            finally:
+                sock.close()
+
+        threading.Thread(target=rtsp_client, daemon=True).start()
+        time.sleep(0.3)
+        relay.map("127.0.0.3", "127.0.0.2", "gsuser9")
+        deadline = time.time() + 3
+        while time.time() < deadline and "reply" not in client_box and "err" not in client_box:
+            time.sleep(0.05)
+        assert client_box.get("reply") == b"RTSP/1.0 200", client_box
+        assert echo_box.get("got") == b"OPTIONS", echo_box
+
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.bind(("127.0.0.3", 0))
+        client.sendto(b"ping", ("127.0.0.4", udp_port))
+        pod.settimeout(2)
+        data, addr = pod.recvfrom(64)
+        assert data == b"ping", data
+        assert addr[0] == "127.0.0.4" and addr[1] == udp_port, addr
+        pod.sendto(b"pong", addr)
+        client.settimeout(2)
+        reply, _who = client.recvfrom(64)
+        assert reply == b"pong"
+
+        other = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        other.bind(("127.0.0.5", 0))
+        relay.map("127.0.0.5", "127.0.0.2", "gsuser1")
+        other.sendto(b"ping2", ("127.0.0.4", udp_port))
+        data, addr = pod.recvfrom(64)
+        assert data == b"ping2"
+        pod.sendto(b"pong2", addr)
+        other.settimeout(2)
+        reply, _who = other.recvfrom(64)
+        assert reply == b"pong2"
+        client.settimeout(0.4)
+        try:
+            stale = client.recvfrom(64)
+        except socket.timeout:
+            stale = None
+        assert stale is None, stale
+
+        stranger = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        stranger.bind(("127.0.0.6", 0))
+        stranger.sendto(b"nope", ("127.0.0.4", udp_port))
+        pod.settimeout(0.4)
+        try:
+            leaked = pod.recvfrom(64)
+        except socket.timeout:
+            leaked = None
+        assert leaked is None, leaked
+
+        closed = socket.socket()
+        closed.bind(("127.0.0.6", 0))
+        closed.settimeout(3)
+        closed.connect(("127.0.0.4", rtsp_port))
+        closed.sendall(b"NOPE")
+        try:
+            got = closed.recv(16)
+        except ConnectionResetError:
+            # Dropping an unread TCP socket is a RST. Either way the client
+            # is not spliced to a pod.
+            got = b""
+        assert got == b""
+        assert "gsuser9" in touches
+        assert "gsuser1" in touches
+    finally:
+        relay.stop()
+        for obj in (pod, client, other, stranger, closed):
+            if obj is None:
+                continue
+            try:
+                obj.close()
+            except OSError:
+                pass
+
+
+def _free_pair():
+    """One UDP port and one TCP port free on the loopback addresses the test uses."""
+    ips = ("127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5", "127.0.0.6")
+    for udp_port in range(26000, 42000, 3):
+        rtsp_port = udp_port + 1
+        held = []
+        try:
+            for ip in ips:
+                for port, kind in ((udp_port, socket.SOCK_DGRAM), (rtsp_port, socket.SOCK_STREAM)):
+                    sock = socket.socket(socket.AF_INET, kind)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind((ip, port))
+                    held.append(sock)
+        except OSError:
+            for sock in held:
+                sock.close()
+            continue
+        for sock in held:
+            sock.close()
+        return udp_port, rtsp_port
+    raise SystemExit("no free relay ports")
 
 
 def _loopback():
@@ -1775,6 +2084,7 @@ def _flow_test():
         sunshine_state_file="sunshine_state.json",
         secret=b"0123456789abcdef",
         admin_password="",
+        relay_bind="127.0.0.4",
     )
 
     class User:
@@ -1843,7 +2153,16 @@ def _flow_test():
 
     proxy._backend = backend
     proxy.start()
-    _wait_port(proxy.ports["http"])
+    try:
+        _wait_port(proxy.ports["http"])
+        _flow_body(proxy, seats)
+    finally:
+        relay = getattr(proxy, "relay", None)
+        if relay is not None:
+            relay.stop()
+
+
+def _flow_body(proxy, seats):
 
     def feed():
         deadline = time.time() + 10

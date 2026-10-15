@@ -49,6 +49,17 @@ data:
   SEAT_CPU_LIMIT: "8"
   SEAT_MEMORY_LIMIT: "16Gi"
   KATA_MEMORY_MIB: "16384"
+  # Secure Boot capable OVMF. The VARS template is the empty one. The
+  # secboot VARS image enrolls keys and then refuses this unsigned guest
+  # kernel. The shim copies the template to <PERSIST_ROOT>/<login>/uefi/
+  # once, and leaves an enrolled store alone. These two paths are also
+  # GS_UEFI_CODE and GS_UEFI_TEMPLATE in /etc/nvkvm-kata/shim.env.
+  KATA_SECURE_BOOT: "true"
+  KATA_FIRMWARE: "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd"
+  KATA_FIRMWARE_VARS: "/usr/share/edk2/ovmf/OVMF_VARS.fd"
+  # Scratchpad emulator. State is <PERSIST_ROOT>/<login>/<TPU_STATE_DIR>/state.bin.
+  TPU_EMULATION: "true"
+  TPU_STATE_DIR: "tpu"
 
   HTTP_PORT: "8080"
   SELKIES_PORT: "8082"
@@ -68,7 +79,10 @@ data:
   SUNSHINE_CONFIG_REL: ".config/sunshine"
   IDLE_SECONDS: "600"
   COOKIE_TTL: "2592000"
-  READY_TIMEOUT: "180"
+  # First boot copies /usr into the shared layer before labwc listens.
+  # 180s expires while that copy is still running and Moonlight is told
+  # the seat failed.
+  READY_TIMEOUT: "900"
   # redirect: Selkies HTTP 307 to the owning proxy. Moonlight gets that
   # proxy's address in serverinfo, then a reset so it retries there.
   # reset: RST Moonlight; the browser gets the retry page.

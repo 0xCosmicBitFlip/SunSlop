@@ -1,0 +1,10 @@
+[package]
+name = "gs-relay"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "UDP and RTSP data plane for the SunSlop Moonlight proxy"
+
+[[bin]]
+name = "gs-relay"
+path = "src/main.rs"

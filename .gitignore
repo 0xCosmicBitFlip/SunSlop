@@ -3,3 +3,4 @@ __pycache__/
 *.zip
 store.json
 proxy-client.crt
+orchestrator/gs-relay/target/

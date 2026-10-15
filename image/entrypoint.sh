@@ -42,11 +42,58 @@ install -d -m 0700 "${runtime}" "${home}"
 if [[ ! -e /dev/uinput ]]; then
   modprobe uinput 2>/dev/null || true
 fi
-if [[ ! -e /dev/uinput ]]; then
-  major="$(awk '$2=="uinput"{print $1}' /proc/devices || true)"
-  if [[ -n "${major}" ]]; then
-    mknod -m 0660 /dev/uinput c "${major}" 223
+# The kata rootfs has no /lib/modules for this kernel. =y drivers register
+# themselves; modprobe is only here for an older =m build.
+for mod in ntsync snd-dummy fuse; do
+  modprobe "$mod" 2>/dev/null || true
+done
+if ! mountpoint -q /run/gs-dev; then
+  install -d /run/gs-dev
+  mount -t devtmpfs devtmpfs /run/gs-dev 2>/dev/null || true
+fi
+if mountpoint -q /run/gs-dev; then
+  for node in fuse ntsync uinput uhid; do
+    if [[ -e "/run/gs-dev/$node" && ! -e "/dev/$node" ]]; then
+      touch "/dev/$node"
+      if ! mount --bind "/run/gs-dev/$node" "/dev/$node"; then
+        rm -f "/dev/$node"
+      fi
+    fi
+  done
+  if [[ -d /run/gs-dev/snd ]]; then
+    install -d /dev/snd
+    if ! mountpoint -q /dev/snd; then
+      mount --bind /run/gs-dev/snd /dev/snd || true
+    fi
   fi
+  if [[ -d /run/gs-dev/dri && ! -e /dev/dri/card0 ]]; then
+    install -d /dev/dri
+    mount --bind /run/gs-dev/dri /dev/dri || true
+  fi
+fi
+# uinput, ntsync, fuse, and uhid are misc devices (major 10). They show up
+# in /proc/misc, not as their own line in /proc/devices. devtmpfs already
+# created the node when the driver is built-in; mknod is the fallback.
+mknod_misc() {
+  local name="$1" mode="$2" minor
+  if [[ -e "/dev/$name" ]]; then
+    return 0
+  fi
+  minor="$(awk -v n="$name" '$2==n {print $1; exit}' /proc/misc || true)"
+  if [[ -z "$minor" ]]; then
+    return 0
+  fi
+  mknod -m "$mode" "/dev/$name" c 10 "$minor"
+}
+mknod_misc fuse 0666 || true
+mknod_misc ntsync 0666 || true
+mknod_misc uinput 0660 || true
+mknod_misc uhid 0666 || true
+if [[ -e /dev/ntsync ]]; then
+  chmod 0666 /dev/ntsync || true
+fi
+if [[ -e /dev/fuse ]]; then
+  chmod 0666 /dev/fuse || true
 fi
 if [[ -e /dev/uinput ]]; then
   group="$(getent group input | cut -d: -f1 || true)"
@@ -54,6 +101,44 @@ if [[ -e /dev/uinput ]]; then
     chgrp "${group}" /dev/uinput || true
   fi
   chmod 0660 /dev/uinput || true
+fi
+if [[ -e /dev/uhid ]]; then
+  chmod 0666 /dev/uhid || true
+fi
+if [[ -d /dev/snd ]]; then
+  chmod 0755 /dev/snd || true
+  find /dev/snd -type c -exec chmod 0666 {} + || true
+fi
+# No udev in this seat. devtmpfs nodes are root:root 0600 until chmod.
+# Proton maps far more VMAs than the default 65530, and Steam watches
+# a lot of files. The limits are inherited by supervisord.
+sysctl -w vm.max_map_count=1048576 >/dev/null 2>&1 || true
+sysctl -w fs.inotify.max_user_watches=1048576 >/dev/null 2>&1 || true
+sysctl -w fs.inotify.max_user_instances=1024 >/dev/null 2>&1 || true
+ulimit -n 524288 || true
+ulimit -l unlimited || true
+if ! mountpoint -q /dev/shm; then
+  install -d -m 1777 /dev/shm
+  mount -t tmpfs -o mode=1777,nosuid,nodev,size=50% shm /dev/shm || true
+fi
+if grep -qw binfmt_misc /proc/filesystems && ! mountpoint -q /proc/sys/fs/binfmt_misc; then
+  install -d /proc/sys/fs/binfmt_misc
+  mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc || true
+fi
+missing=""
+awk '$2=="uinput"{found=1} END{exit !found}' /proc/misc || missing="${missing} uinput"
+grep -q ntsync /proc/misc || missing="${missing} ntsync"
+grep -qw squashfs /proc/filesystems || missing="${missing} squashfs"
+grep -qw overlay /proc/filesystems || missing="${missing} overlay"
+grep -qw fuse /proc/filesystems || missing="${missing} fuse"
+grep -qi dummy /proc/asound/cards 2>/dev/null || missing="${missing} snd-dummy"
+[[ -e /dev/uinput ]] || missing="${missing} /dev/uinput"
+[[ -e /dev/ntsync ]] || missing="${missing} /dev/ntsync"
+[[ -e /dev/fuse ]] || missing="${missing} /dev/fuse"
+if [[ -n "${missing}" ]]; then
+  echo "desktop-kernel: missing${missing} (rebuild the nvkvm guest with deploy/kata/desktop.x86_64.conf, kernel >= 6.14)" >&2
+else
+  echo "desktop-kernel: uinput ntsync squashfs overlay fuse snd-dummy"
 fi
 
 case "$layer" in
@@ -139,7 +224,7 @@ elif getent passwd "$uid" >/dev/null; then
 else
   useradd -u "$uid" -g "$gid" -d "$home" -M -s /bin/bash "$user"
 fi
-for g in render video input; do
+for g in render video input audio; do
   getent group "$g" >/dev/null && usermod -aG "$g" "$user" || true
 done
 chown "${user}:${user}" "$runtime" "$home" || true

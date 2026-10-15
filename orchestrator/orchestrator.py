@@ -737,6 +737,11 @@ class Config:
     sunshine_config_rel: str = ".config/sunshine"
     selkies_addr: str = "0.0.0.0"
     public_http_base: str = ""
+    kata_firmware: str = "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd"
+    kata_firmware_vars: str = "/usr/share/edk2/ovmf/OVMF_VARS.fd"
+    kata_secure_boot: bool = True
+    tpu_emulation: bool = True
+    tpu_state_dir: str = "tpu"
 
 
 def env_get(name, default):
@@ -820,6 +825,24 @@ def load_config():
     seat_uid = env_int("SEAT_UID", 1000)
     seat_gid = env_int("SEAT_GID", 1000)
     seat_home = _safe(env_get("SEAT_HOME", "/home/" + seat_user), "SEAT_HOME")
+    kata_secure_boot = env_bool("KATA_SECURE_BOOT", True)
+    kata_firmware = ""
+    kata_firmware_vars = ""
+    if kata_secure_boot:
+        kata_firmware = _safe(
+            env_get("KATA_FIRMWARE", "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd"),
+            "KATA_FIRMWARE",
+        )
+        kata_firmware_vars = _safe(
+            env_get("KATA_FIRMWARE_VARS", "/usr/share/edk2/ovmf/OVMF_VARS.fd"),
+            "KATA_FIRMWARE_VARS",
+        )
+    tpu_emulation = env_bool("TPU_EMULATION", True)
+    tpu_state_dir = "tpu"
+    if tpu_emulation:
+        tpu_state_dir = _dir_name(env_get("TPU_STATE_DIR", "tpu"), "TPU_STATE_DIR")
+        if tpu_state_dir == "uefi":
+            raise SystemExit("bad TPU_STATE_DIR")
     xdg_runtime = _safe(env_get("XDG_RUNTIME_DIR", f"/run/user/{seat_uid}"), "XDG_RUNTIME_DIR")
     wayland_display = _safe(env_get("WAYLAND_DISPLAY", "wayland-0"), "WAYLAND_DISPLAY")
     common_mount = _safe(
@@ -846,7 +869,7 @@ def load_config():
         sessions_per_gpu=env_int("SESSIONS_PER_GPU", 8),
         http_port=http_port,
         selkies_port=env_int("SELKIES_PORT", 8082),
-        ready_timeout=env_int("READY_TIMEOUT", 180),
+        ready_timeout=env_int("READY_TIMEOUT", 900),
         device_plugin=env_get("DEVICE_PLUGIN", "true").lower() not in ("0", "false", "no"),
         http_foreign=env_get("HTTP_FOREIGN", "redirect"),
         memory_limit=env_get("SEAT_MEMORY_LIMIT", "16Gi"),
@@ -898,7 +921,37 @@ def load_config():
         sunshine_config_rel=_safe(env_get("SUNSHINE_CONFIG_REL", ".config/sunshine"), "SUNSHINE_CONFIG_REL"),
         selkies_addr=env_get("SELKIES_ADDR", "0.0.0.0"),
         public_http_base=os.environ.get("PUBLIC_HTTP_BASE", ""),
+        kata_firmware=kata_firmware,
+        kata_firmware_vars=kata_firmware_vars,
+        kata_secure_boot=kata_secure_boot,
+        tpu_emulation=tpu_emulation,
+        tpu_state_dir=tpu_state_dir,
     )
+
+
+def kata_annotations(cfg, home, activity):
+    """What the host shim reads. kernel_params is appended by Kata, and only
+    if configuration-nvkvm.toml lists it in enable_annotations. The firmware
+    annotation is the OVMF code image; the per-login variable store is the
+    sunslop.uefi_vars token, because Kata 4.1 does not pass firmware_volume
+    through on a normal guest.
+    """
+    ann = {
+        "io.katacontainers.config.hypervisor.default_vcpus": cfg.cpu_limit,
+        "io.katacontainers.config.hypervisor.default_memory": cfg.kata_memory,
+        ACTIVITY: activity,
+    }
+    home = home.rstrip("/")
+    params = []
+    if cfg.kata_secure_boot:
+        ann["io.katacontainers.config.hypervisor.firmware"] = cfg.kata_firmware
+        params.append("sunslop.uefi_vars=%s/uefi/OVMF_VARS.fd" % home)
+        params.append("sunslop.uefi_code=%s" % cfg.kata_firmware)
+    if cfg.tpu_emulation:
+        params.append("sunslop.tpu_state=%s/%s" % (home, cfg.tpu_state_dir))
+    if params:
+        ann["io.katacontainers.config.hypervisor.kernel_params"] = " ".join(params)
+    return ann
 
 
 def seat_pod(cfg, user, gpu, node=None):
@@ -945,6 +998,9 @@ def seat_pod(cfg, user, gpu, node=None):
         {"name": "XDG_RUNTIME_DIR", "value": cfg.xdg_runtime},
         {"name": "WAYLAND_DISPLAY", "value": cfg.wayland_display},
     ]
+    if cfg.tpu_emulation:
+        env.append({"name": "GS_TPU_STATE", "value": cfg.seat_home.rstrip("/") + "/" + cfg.tpu_state_dir})
+        env.append({"name": "GS_TPU_DEVICE", "value": "/dev/virtio-ports/org.sunslop.tpu"})
     mounts = [
         {"name": "home", "mountPath": cfg.seat_home},
         {"name": "common", "mountPath": cfg.common_mount},
@@ -976,11 +1032,7 @@ def seat_pod(cfg, user, gpu, node=None):
                 "gamestream.local/user": user.name,
                 "gamestream.local/gpu": str(gpu),
             },
-            "annotations": {
-                "io.katacontainers.config.hypervisor.default_vcpus": cfg.cpu_limit,
-                "io.katacontainers.config.hypervisor.default_memory": cfg.kata_memory,
-                ACTIVITY: str(int(time.time())),
-            },
+            "annotations": kata_annotations(cfg, home, str(int(time.time()))),
         },
         "spec": {
             "restartPolicy": "Never",
@@ -1001,7 +1053,7 @@ def seat_pod(cfg, user, gpu, node=None):
                         "exec": {"command": ["/bin/bash", "-lc", f"test -S {wayland}"]},
                         "initialDelaySeconds": 3,
                         "periodSeconds": 2,
-                        "failureThreshold": 90,
+                        "failureThreshold": 450,
                     },
                     "resources": {"requests": requests, "limits": limits},
                     "volumeMounts": mounts,
@@ -1747,6 +1799,22 @@ def self_test():
     assert pod["spec"]["nodeName"] == "n1"
     assert pod["metadata"]["labels"]["gamestream.local/gpu"] == "1"
     assert pod["metadata"]["annotations"][ACTIVITY].isdigit()
+    ann = pod["metadata"]["annotations"]
+    assert ann["io.katacontainers.config.hypervisor.firmware"].endswith("OVMF_CODE.secboot.fd")
+    boot = ann["io.katacontainers.config.hypervisor.kernel_params"]
+    assert "sunslop.tpu_state=/data/persist/gsuser0/tpu" in boot
+    assert "sunslop.uefi_vars=/data/persist/gsuser0/uefi/OVMF_VARS.fd" in boot
+    assert ".." not in boot
+    cfg.tpu_emulation = False
+    cfg.kata_secure_boot = False
+    quiet = seat_pod(cfg, users["gsuser0"], 1)
+    qann = quiet["metadata"]["annotations"]
+    assert "io.katacontainers.config.hypervisor.firmware" not in qann
+    assert "io.katacontainers.config.hypervisor.kernel_params" not in qann
+    qenv = {item["name"]: item["value"] for item in quiet["spec"]["containers"][0]["env"]}
+    assert "GS_TPU_STATE" not in qenv
+    cfg.tpu_emulation = True
+    cfg.kata_secure_boot = True
     assert pod_port(48089, 48089) == 47989
     assert pod_port(48084, 48089) == 47984
     assert pod_port(48098, 48089) == 47998
@@ -1757,6 +1825,8 @@ def self_test():
     assert env["GS_LAYER"] == "/gs-layer"
     assert env["GS_HOME"] == "/home/gsuser"
     assert env["GS_USER"] == "gsuser"
+    assert env["GS_TPU_STATE"] == "/home/gsuser/tpu"
+    assert env["GS_TPU_DEVICE"] == "/dev/virtio-ports/org.sunslop.tpu"
     assert pod["spec"]["volumes"][2]["hostPath"]["path"].endswith("/gs-layer")
     probe = pod["spec"]["containers"][0]["readinessProbe"]["exec"]["command"][-1]
     assert probe == "test -S /run/user/1000/wayland-0"

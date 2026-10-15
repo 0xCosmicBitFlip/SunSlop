@@ -11,6 +11,11 @@ metadata:
     app: ${SEAT_APP}
     gamestream.local/user: ${SEAT_DIRECT_USER}
     gamestream.local/gpu: "${SEAT_DIRECT_GPU}"
+  annotations:
+    io.katacontainers.config.hypervisor.default_vcpus: "${SEAT_CPU_LIMIT}"
+    io.katacontainers.config.hypervisor.default_memory: "${KATA_MEMORY_MIB}"
+    io.katacontainers.config.hypervisor.firmware: ${KATA_FIRMWARE}
+    io.katacontainers.config.hypervisor.kernel_params: "sunslop.uefi_vars=${PERSIST_ROOT}/${SEAT_DIRECT_USER}/uefi/OVMF_VARS.fd sunslop.uefi_code=${KATA_FIRMWARE} sunslop.tpu_state=${PERSIST_ROOT}/${SEAT_DIRECT_USER}/${TPU_STATE_DIR}"
 spec:
   restartPolicy: Never
   runtimeClassName: ${RUNTIME_CLASS}
@@ -80,6 +85,10 @@ spec:
           value: ${XDG_RUNTIME_DIR}
         - name: WAYLAND_DISPLAY
           value: ${WAYLAND_DISPLAY}
+        - name: GS_TPU_STATE
+          value: ${SEAT_HOME}/${TPU_STATE_DIR}
+        - name: GS_TPU_DEVICE
+          value: /dev/virtio-ports/org.sunslop.tpu
       securityContext:
         runAsUser: 0
         capabilities:
@@ -89,7 +98,7 @@ spec:
           command: ["/bin/bash", "-lc", "test -S ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"]
         initialDelaySeconds: 3
         periodSeconds: 2
-        failureThreshold: 90
+        failureThreshold: 450
       resources:
         requests:
           cpu: "${SEAT_CPU_REQUEST}"

@@ -65,6 +65,10 @@ dnf install -y git
 dnf config-manager --set-enabled crb
 git clone https://github.com/reindertpelsma/nvkvm-kata
 cd nvkvm-kata
+# Desktop fragment: uinput, ntsync, squashfs, 32-bit, a dummy sound card, EFI.
+# Also defaults memfd_create on. The guest kernel nvkvm builds is >= 6.14.
+# --graphics 1 stays required; the fragment does not turn CONFIG_DRM on.
+bash /path/to/SunSlop/deploy/kata/apply-desktop-kernel.sh .
 sudo scripts/nvkvm-kata-install.sh \
   --install-kata \
   --install-deps \
@@ -158,6 +162,58 @@ scheduling:
 
 Do not label the node yet. The label is the last step, after the gate passes. The handler string has to be the containerd runtime key, which is `nvkvm-kata` unless you changed `--runtime-name`.
 
+## Secure Boot and the TPU
+
+Each seat VM gets both. Kata 4.1 cannot do either by itself.
+
+`firmware` becomes `-bios`. OVMF Secure Boot needs two pflash chips, and `firmware_volume` is only wired up for a TDX guest. There is no annotation for an extra `-device`. The seat pod still asks, and [deploy/kata/gs_kata_shim.py](../deploy/kata/gs_kata_shim.py) is `hypervisor.path`. It rewrites the QEMU argv, then execs the nvkvm shim so the virtio GPU device is unchanged.
+
+On the GPU node:
+
+```bash
+dnf install -y edk2-ovmf
+install -m 0755 deploy/kata/gs_kata_shim.py /usr/local/bin/gs-kata-shim
+python3 /usr/local/bin/gs-kata-shim --self-test
+```
+
+In `/etc/kata-containers/configuration-nvkvm.toml`, set `path` to the new shim and append the annotation names the seats use. `default_vcpus` and `default_memory` are already on the pod; they do nothing until they are listed here too.
+
+```toml
+[hypervisor.qemu]
+path = "/usr/local/bin/gs-kata-shim"
+enable_annotations = ["default_vcpus", "default_memory", "firmware", "kernel_params"]
+```
+
+Keep every name that was already in `enable_annotations`. Add the shim to `valid_hypervisor_paths` if that list is not empty. `kernel_params` is a trusted annotation: anyone who can create a pod on this RuntimeClass can point the shim at a login directory under `GS_PERSIST_ROOT`. The orchestrator is the only creator. Listing `firmware` without `kernel_params` is the broken case: Kata passes `-bios` and the shim never sees the variable-store path, so it cannot rewrite it.
+
+`/etc/nvkvm-kata/shim.env` (the same file the nvkvm shim already reads):
+
+```
+GS_PERSIST_ROOT=/var/lib/gamestream/persistent
+GS_UEFI_CODE=/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd
+GS_UEFI_TEMPLATE=/usr/share/edk2/ovmf/OVMF_VARS.fd
+NVKVM_SHIM=/opt/nvkvm-kata/bin/nvkvm-qemu-shim
+```
+
+`GS_PERSIST_ROOT` is the same string as `PERSIST_ROOT`. `GS_UEFI_CODE` and `GS_UEFI_TEMPLATE` are the same strings as `KATA_FIRMWARE` and `KATA_FIRMWARE_VARS`. The template has to be the empty variable store. `OVMF_VARS.secboot.fd` already has keys enrolled, and this guest kernel is not signed, so the VM would not boot. With the empty store the firmware is Secure Boot capable and Secure Boot is off. Enrolling keys writes the per-login store; the next pod for that login keeps them, and then the unsigned kernel will not boot. That file is `<PERSIST_ROOT>/<login>/uefi/OVMF_VARS.fd`. Delete it to start from the template again.
+
+The shim refuses any other path. A `..` component is rejected before it is normalized. If the firmware files are missing, or the variable store cannot be created, `-bios` is removed and the seat falls back to Kata's direct kernel boot instead of hanging on a half-configured OVMF. `KATA_SECURE_BOOT=false` does not ask.
+
+The TPU is a 1 MiB int8 scratchpad on a virtio serial port, not a Cloud TPU and not `libtpu`. QEMU has no TPU model, and neither does nvkvm. The device in the guest is `/dev/virtio-ports/org.sunslop.tpu` (`GS_TPU_DEVICE`). The scratchpad file is `<PERSIST_ROOT>/<login>/<TPU_STATE_DIR>/state.bin`, which the seat sees at `GS_TPU_STATE` because the home mount is that login's directory. The socket stays on the host under `/run/gs-tpu/`. Deleting the pod does not delete the file. `TPU_EMULATION=false` does not ask.
+
+The port speaks four lines. Offsets are bytes.
+
+| Line | Effect |
+|---|---|
+| `STAT` | `OK 1048576` |
+| `READ <off> <len>` | up to 4096 bytes after the `OK <len>` line |
+| `WRITE <off> <len>` and then that many bytes | stored, then `fsync` |
+| `DOT <a> <b> <n> <dst>` | int8 dot product, int32 little-endian result stored at `dst` |
+
+`DOT` with `n` past either vector, or a `WRITE` past the end, returns `ERR range` and does not extend the file.
+
+The gate pod below does not carry these annotations, so it does not prove this section. After a real seat is up: `ls /sys/firmware/efi` (Secure Boot firmware ran) and `ls /dev/virtio-ports/org.sunslop.tpu`. A seat that never becomes Ready after this change is the OVMF path; set `KATA_SECURE_BOOT=false` and leave the TPU on. `nosmm` is stripped and `smm=on` is added only when the pflash path is actually used. OVMF Secure Boot needs SMM.
+
 ## Prove the runtime before you label the node
 
 A CUDA image is enough to prove the driver. It is not enough to prove the display. Run both checks inside a guest, on this node.
@@ -187,14 +243,24 @@ spec:
           nvidia-smi -L
           echo "DRI \$(ls -1 /dev/dri 2>/dev/null || echo NONE)"
           echo "NVIDIA0 \$(ls -l /dev/nvidia0 2>/dev/null || echo NONE)"
+          echo "FS \$(grep -E 'squashfs|overlay|fuse' /proc/filesystems | tr '\n' ' ')"
+          echo "NTSYNC \$(grep ntsync /proc/misc || echo NONE)"
+          echo "UINPUT \$(awk '\$2==\"uinput\"{print}' /proc/misc || echo NONE)"
+          echo "SND \$(grep -i dummy /proc/asound/cards 2>/dev/null || echo NONE)"
           if [[ -r /proc/config.gz ]]; then
             gzip -dc /proc/config.gz | grep -E \\
-              'CONFIG_(INPUT_UINPUT|USER_NS|DRM)='
+              '^CONFIG_(INPUT_UINPUT|INPUT_MISC|INPUT_EVDEV|NTSYNC|FUSE_FS|FUSE_PASSTHROUGH|OVERLAY_FS|SQUASHFS|IA32_EMULATION|SND_DUMMY|SND_SEQUENCER|USER_NS|DRM|EFI|MEMFD_CREATE|IKCONFIG_PROC)='
           else
             echo "NO_PROC_CONFIG"
           fi
           test -e /dev/nvidia0
           test -e /dev/dri/card0
+          grep -q squashfs /proc/filesystems
+          grep -q overlay /proc/filesystems
+          grep -q fuse /proc/filesystems
+          awk '\$2=="uinput"{found=1} END{exit !found}' /proc/misc
+          grep -q ntsync /proc/misc
+          grep -qi dummy /proc/asound/cards
           echo GATE_OK
       resources:
         limits:
@@ -214,9 +280,12 @@ Required before any streaming pod:
 | `uname -r` ends in something other than the host kernel | guest kernel booted | the pod ran on runc, or the RuntimeClass handler is wrong |
 | `nvidia-smi -L` lists one GPU | driver libraries were injected and the virtio GPU attached | CDI discover failed, or the operator took the card onto vfio |
 | `/dev/dri/card0` exists | `--graphics 1` actually built a display | streaming cannot work on this build. Stop. |
-| `CONFIG_INPUT_UINPUT=y` or `=m` | Sunshine can create a gamepad inside the guest | do not mount host `uinput` to compensate |
+| `uinput` in `/proc/misc` | the desktop fragment was merged; Sunshine can create a gamepad | the guest is still the compute kernel. Re-run `apply-desktop-kernel.sh` and rebuild. Do not mount host `uinput`. The node is misc major 10, not its own line in `/proc/devices`. |
+| `ntsync` in `/proc/misc` | Proton can use `/dev/ntsync` | kernel is older than 6.14, or `CONFIG_NTSYNC` did not land |
+| `squashfs`, `overlay`, and `fuse` in `/proc/filesystems` | Steam Linux Runtime can mount its images | fragment was not in the build |
+| `dummy` in `/proc/asound/cards` | PipeWire and Proton have a sound card with no host DAC | `CONFIG_SND_DUMMY` did not land |
 
-`GATE_OK` is the only line that counts. `NVIDIA0 NONE` with a working `nvidia-smi` can still be fine, because nvkvm's device nodes are created by the guest module and are not the host's `/dev/nvidia0`. A missing `/dev/dri/card0` is not fine.
+`GATE_OK` is the only line that counts. `NVIDIA0 NONE` with a working `nvidia-smi` can still be fine, because nvkvm's device nodes are created by the guest module and are not the host's `/dev/nvidia0`. A missing `/dev/dri/card0` is not fine. `NO_PROC_CONFIG` means `CONFIG_IKCONFIG_PROC` did not land; the `/proc` checks above are still required. `/sys/firmware/efi` is not on this gate pod. The gate does not carry the seat firmware annotation, so it is direct-kernel boot even when `CONFIG_EFI=y`. A real seat with Secure Boot enabled is the EFI check.
 
 Also confirm the host card never moved:
 
