@@ -83,10 +83,11 @@ def install_proxy_cert(data, cert_pem, name):
             device["name"] = name
             device["cert"] = pem
             device["uuid"] = device.get("uuid") or cert_uuid(pem)
+            device["enabled"] = True
             found = True
         kept.append(device)
     if not found:
-        kept.append({"name": name, "cert": pem, "uuid": cert_uuid(pem)})
+        kept.append({"name": name, "cert": pem, "uuid": cert_uuid(pem), "enabled": True})
     root["named_devices"] = kept
     if not root.get("uniqueid"):
         root["uniqueid"] = uuid.uuid4().hex
@@ -183,6 +184,12 @@ def load_state(path):
 
 def apply_boot(conf_path, state_path, env):
     updates = managed_from_env(env)
+    state_abs = os.path.abspath(state_path)
+    if any(c in state_abs for c in "\n\r\t#;|&$`<>'\"\\"):
+        raise SystemExit("unsafe sunshine state path")
+    # Sunshine resolves a relative file_state under its appdata dir, which is
+    # not the process cwd. Pin the file this boot just wrote.
+    updates["file_state"] = state_abs
     previous = ""
     if os.path.isfile(conf_path):
         previous = open(conf_path).read()
@@ -229,8 +236,42 @@ def self_test():
     assert [d["name"] for d in devices] == ["phone", "gs-proxy"]
     assert "NEW" in devices[1]["cert"]
     assert devices[1]["uuid"] == "old"
+    assert devices[1]["enabled"] is True
     fresh = install_proxy_cert({}, "-----BEGIN CERTIFICATE-----\nNEW\n-----END CERTIFICATE-----", "gs-proxy")
     assert fresh["root"]["named_devices"][0]["uuid"]
+    assert fresh["root"]["named_devices"][0]["enabled"] is True
+    turned_off = install_proxy_cert(
+        {"root": {"named_devices": [
+            {"name": "gs-proxy", "cert": "-----BEGIN CERTIFICATE-----\nOLD\n-----END CERTIFICATE-----\n",
+             "uuid": "old", "enabled": False},
+        ]}},
+        "-----BEGIN CERTIFICATE-----\nNEW\n-----END CERTIFICATE-----",
+        "gs-proxy",
+    )
+    assert turned_off["root"]["named_devices"][0]["enabled"] is True
+    assert "NEW" in turned_off["root"]["named_devices"][0]["cert"]
+    import tempfile
+    boot = tempfile.mkdtemp()
+    conf = os.path.join(boot, "sunshine.conf")
+    state = os.path.join(boot, "sunshine_state.json")
+    open(conf, "w").write("capture = wlr\nport = 1\n")
+    cert_file = os.path.join(boot, "proxy-client.crt")
+    open(cert_file, "w").write("-----BEGIN CERTIFICATE-----\nBOOT\n-----END CERTIFICATE-----\n")
+    updates, paired = apply_boot(conf, state, {
+        "SUNSHINE_BASE_PORT": "47989",
+        "GS_PROXY_CERT": cert_file,
+        "GS_PROXY_CERT_REQUIRED": "1",
+        "GS_PROXY_CERT_WAIT": "0",
+        "GS_PROXY_CLIENT_NAME": "gs-proxy",
+    })
+    assert paired
+    assert updates["file_state"] == os.path.abspath(state)
+    written = open(conf).read()
+    assert f"file_state = {os.path.abspath(state)}" in written
+    assert "port = 47989" in written
+    saved = json.load(open(state))
+    assert saved["root"]["named_devices"][0]["enabled"] is True
+    assert saved["root"]["uniqueid"]
     env = {
         "SUNSHINE_BASE_PORT": "48000",
         "SUNSHINE_HTTPS_OFFSET": "-5",

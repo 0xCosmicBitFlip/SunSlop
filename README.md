@@ -86,7 +86,7 @@ Proxies have the addresses clients can reach. The orchestrator may place the sea
 
 - `redirect` (the default). Selkies is a browser, so it gets HTTP 307 to the owning proxy (`hostIP`, or the pod annotation `gamestream.local/advertise`, wrapped by `PUBLIC_HTTP_BASE`). Moonlight's control channel is also HTTP, and Qt 6 and the Android client will follow a 307, but that does not move the stream. RTSP and UDP are opened to the address that answered, not to the Location host. Moonlight stores `LocalIP` and `ExternalIP` from `serverinfo` and polls those next. Desktop tries the current address first, then the stored one. Android tries `LocalIP` first. The wrong proxy answers one `serverinfo` with the owning proxy's address, then RSTs. The next poll fails here, succeeds on the owning proxy, and that becomes the stream address. Pairing is not redirected.
 - `reset`: Moonlight gets a TCP RST (`SO_LINGER` 0, not a TLS close) so this address fails and the client tries the next one it already has. The browser gets the retry page instead of a 307.
-- `proxy`: both are spliced to the pod IP. Moonlight only does this when the pod IP is already known; otherwise it uses the redirect behavior above. Prefer `redirect`. A spliced `serverinfo` is the seat's own answer and can record the pod address.
+- `proxy`: both are spliced to the pod IP. Moonlight only does this when the pod IP is already known; otherwise it uses the redirect behavior above. Prefer `redirect`. A spliced `serverinfo` or `launch` is rewritten on the way out: `LocalIP`, `uniqueid`, and the RTSP url use the host the client dialed, not the pod address Sunshine saw.
 
 UDP and RTSP have no redirect. They show up on the owning proxy only after the client has moved.
 

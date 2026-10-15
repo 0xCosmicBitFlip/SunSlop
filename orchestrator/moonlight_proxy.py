@@ -24,6 +24,7 @@ client has moved.
 import hmac
 import json
 import os
+import re
 import secrets
 import socket
 import ssl
@@ -754,24 +755,121 @@ def reset_tcp(sock):
     """RST the client. A TLS close_notify looks like a finished request, so
     Moonlight keeps this address. Linger-0 fails the poll of this address
     and the client tries the next one it stored.
+
+    SSLSocket has no `_sock` in current CPython, and closing it sends
+    close_notify (a FIN). detach() drops the TLS object without that
+    shutdown; the kernel socket is then closed with SO_LINGER 0.
     """
     import struct
-    raw = sock
-    seen = set()
-    while raw is not None and id(raw) not in seen:
-        seen.add(id(raw))
-        nxt = getattr(raw, "_sock", None)
-        if nxt is None or nxt is raw:
+    try:
+        fd = sock.detach()
+    except Exception:
+        fd = None
+    if isinstance(fd, int) and fd >= 0:
+        try:
+            raw = socket.socket(fileno=fd)
+            raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            raw.close()
+            return
+        except OSError:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    except OSError:
+        pass
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+_HOST_OK = re.compile(r"^[A-Za-z0-9._-]+$")
+_HOST_V6 = re.compile(r"^\[[0-9A-Fa-f:.]+\]$")
+_SESSION_URL = re.compile(r"(rtsp(?:enc)?://)(\[[^\]]+\]|[^/:]+)(:\d+)")
+
+
+def host_only(value):
+    """Host header without the port. Bracketed IPv6 keeps its brackets."""
+    host = (value or "").strip()
+    if not host:
+        return ""
+    if host.startswith("["):
+        end = host.find("]")
+        return host[:end + 1] if end > 1 else ""
+    if host.count(":") == 1:
+        name, port = host.split(":", 1)
+        if port.isdigit():
+            return name
+    return host
+
+
+def safe_host(value):
+    host = host_only(value)
+    if _HOST_OK.match(host) or _HOST_V6.match(host):
+        return host
+    return ""
+
+
+def facing_host(raw, sock):
+    """Address the client put in Host, else the local address it reached.
+
+    Moonlight's Host is the computer it dialed. Sunshine's own answer uses
+    the pod IP, which the client would store as LocalIP and open RTSP to.
+    """
+    text = raw.split(b"\r\n\r\n", 1)[0].decode("iso-8859-1", "replace")
+    for line in text.split("\r\n")[1:]:
+        if line.lower().startswith("host:"):
+            host = safe_host(line.split(":", 1)[1])
+            if host:
+                return host
             break
-        raw = nxt
-    try:
-        raw.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-    except OSError:
-        pass
-    try:
-        raw.close()
-    except OSError:
-        pass
+    return _sock_ip(sock)
+
+
+def rewrite_backend_response(raw, host, uniqueid):
+    """Sunshine answered from the pod. Put the client's host back.
+
+    LocalIP is what Moonlight stores and polls next (Android tries it
+    first). sessionUrl0 is the RTSP url; current moonlight-common-c dials
+    the active address but uses this host in the RTSP request. uniqueid is
+    the computer id. The seat has its own, and a later poll must not look
+    like a different PC from the serverinfo this proxy already sent.
+    """
+    host = safe_host(host)
+    if not raw or not host or b"\r\n\r\n" not in raw:
+        return raw
+    head, _, body = raw.partition(b"\r\n\r\n")
+    if b"<" not in body:
+        return raw
+    text = body.decode("utf-8", "replace")
+    text = re.sub(
+        r"(<LocalIP>)[^<]*(</LocalIP>)",
+        lambda m: m.group(1) + host + m.group(2),
+        text,
+    )
+    if uniqueid and re.fullmatch(r"[A-Za-z0-9-]+", uniqueid):
+        text = re.sub(
+            r"(<uniqueid>)[^<]*(</uniqueid>)",
+            lambda m: m.group(1) + uniqueid + m.group(2),
+            text,
+        )
+    text = _SESSION_URL.sub(lambda m: m.group(1) + host + m.group(3), text)
+    new_body = text.encode("utf-8")
+    lines = []
+    saw_length = False
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            lines.append(b"Content-Length: " + str(len(new_body)).encode())
+            saw_length = True
+        else:
+            lines.append(line)
+    if not saw_length:
+        lines.append(b"Content-Length: " + str(len(new_body)).encode())
+    return b"\r\n".join(lines) + b"\r\n\r\n" + new_body
 
 
 class MoonlightProxy:
@@ -794,6 +892,40 @@ class MoonlightProxy:
         self._pointed = set()
         self._map_lock = threading.Lock()
         self._stop = threading.Event()
+        self._tls_ctx = None
+        self._trust_lock = threading.Lock()
+        self._trusted = None
+
+    def _refresh_trust(self):
+        """Trust paired client certs so the TLS handshake can finish.
+
+        Moonlight's cert is self-signed. CERT_OPTIONAL still verifies a
+        presented cert, and Python rejects it with no matching trust
+        anchor, before we can read it. Loading the paired PEMs makes
+        that handshake succeed. An unknown cert still fails the
+        handshake; HTTP serverinfo remains the unpaired poll.
+        """
+        with self._trust_lock:
+            ctx = self._tls_ctx
+            clients = (self.store.snapshot().get("clients") or [])
+            fps = tuple(sorted(c.get("fingerprint") or "" for c in clients))
+            if ctx is None or fps == self._trusted:
+                return
+            pems = []
+            for client in clients:
+                cert = client.get("cert") or ""
+                if "BEGIN CERTIFICATE" not in cert:
+                    continue
+                pems.append(cert if str(cert).endswith("\n") else str(cert) + "\n")
+            if pems:
+                try:
+                    ctx.load_verify_locations(cadata="".join(pems))
+                except ssl.SSLError as exc:
+                    log(f"client trust: {exc}")
+                    return
+            self._trusted = fps
+            if pems:
+                log(f"trusting {len(pems)} moonlight client certificate(s)")
 
     def start(self):
         threading.Thread(target=self._tls_loop, name="moon-tls", daemon=True).start()
@@ -884,6 +1016,9 @@ class MoonlightProxy:
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(cert_path, key_path)
         ctx.verify_mode = ssl.CERT_OPTIONAL
+        with self._trust_lock:
+            self._tls_ctx = ctx
+        self._refresh_trust()
         listen = self._bind(socket.SOCK_STREAM, self.ports["https"])
         listen.listen(64)
         while not self._stop.is_set():
@@ -895,7 +1030,9 @@ class MoonlightProxy:
 
     def _tls_client(self, ctx, conn, addr):
         backend = None
+        ssock = None
         try:
+            self._refresh_trust()
             conn.settimeout(self.cfg.ready_timeout + 30)
             ssock = ctx.wrap_socket(conn, server_side=True)
             try:
@@ -918,7 +1055,9 @@ class MoonlightProxy:
                         ssock.sendall(xml_response({"paired": 1 if known else 0}))
                     else:
                         cert, key, _uid = self.store.server_material()
-                        ssock.sendall(self.pairs.handle(query, cert, key))
+                        reply = self.pairs.handle(query, cert, key)
+                        self._refresh_trust()
+                        ssock.sendall(reply)
                     continue
                 client = self.store.client_for_der(peer)
                 user = self.directory.get(client["gsuser"]) if client else None
@@ -965,11 +1104,12 @@ class MoonlightProxy:
                 resp, _rest = read_response(backend)
                 if resp is None:
                     break
-                ssock.sendall(resp)
+                _cert, _key, uid = self.store.server_material()
+                ssock.sendall(rewrite_backend_response(resp, facing_host(raw, ssock), uid))
         except (OSError, ssl.SSLError) as exc:
             log(f"tls {addr[0]}: {exc}")
         finally:
-            for sock in (backend, conn):
+            for sock in (backend, ssock, conn):
                 if sock is None:
                     continue
                 try:
@@ -988,6 +1128,7 @@ class MoonlightProxy:
         ctx.load_cert_chain(_write_temp(cert), _write_temp(key))
         try:
             raw = socket.create_connection((pod_ip, self.ports["https"]), timeout=20)
+            raw.settimeout(None)
             return ctx.wrap_socket(raw, server_hostname="sunshine")
         except (OSError, ssl.SSLError) as exc:
             log(f"{gsuser}: backend tls {exc}")
@@ -1060,7 +1201,9 @@ class MoonlightProxy:
                 query = urllib.parse.parse_qs(parsed.query)
                 if parsed.path == "/pair":
                     cert, key, _uid = self.store.server_material()
-                    conn.sendall(self.pairs.handle(query, cert, key))
+                    reply = self.pairs.handle(query, cert, key)
+                    self._refresh_trust()
+                    conn.sendall(reply)
                     continue
                 if parsed.path == "/unpair":
                     uid = query.get("uniqueid", [""])[0]
@@ -1390,7 +1533,27 @@ def self_test():
     assert moonlight_foreign("reset", "10.0.0.2", "", "/serverinfo", False) == "reset"
     assert moonlight_foreign("proxy", "10.0.0.2", "10.9.0.4", "/serverinfo", False) == "splice"
     assert moonlight_foreign("proxy", "10.0.0.2", "", "/serverinfo", False) == "point"
+    sample = http_response(
+        b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+        b"<root status_code=\"200\"><uniqueid>SEAT</uniqueid>"
+        b"<LocalIP>10.9.9.9</LocalIP><currentgame>7</currentgame>"
+        b"<sessionUrl0>rtsp://10.9.9.9:48010</sessionUrl0>"
+        b"<sessionUrl1>rtspenc://10.9.9.9:48010</sessionUrl1></root>",
+        b"application/xml",
+    )
+    rewritten = rewrite_backend_response(sample, "5.5.5.5:47984", "proxyuid")
+    assert b"<LocalIP>5.5.5.5</LocalIP>" in rewritten
+    assert b"<uniqueid>proxyuid</uniqueid>" in rewritten
+    assert b"rtsp://5.5.5.5:48010" in rewritten
+    assert b"rtspenc://5.5.5.5:48010" in rewritten
+    assert b"<currentgame>7</currentgame>" in rewritten
+    assert b"10.9.9.9" not in rewritten
+    assert b"Content-Length: " + str(rewritten.split(b"\r\n\r\n", 1)[1].__len__()).encode() in rewritten
+    assert safe_host("5.5.5.5:47984") == "5.5.5.5"
+    assert safe_host("[2001:db8::1]:47984") == "[2001:db8::1]"
+    assert safe_host("bad host") == ""
     _loopback()
+    _flow_test()
     print("moonlight self-test ok")
 
 
@@ -1408,17 +1571,23 @@ def _loopback():
         listen.listen(4)
         http_box.append(listen.getsockname()[1])
         http_ready.set()
-        listen.settimeout(20)
+        deadline = time.time() + 60
+        listen.settimeout(1)
+        conn = None
         try:
-            try:
-                conn, _addr = listen.accept()
-            except socket.timeout:
-                listen.close()
-                return
+            while time.time() < deadline:
+                try:
+                    conn, _addr = listen.accept()
+                    break
+                except socket.timeout:
+                    continue
         except Exception:
             listen.close()
             return
-        conn.settimeout(20)
+        if conn is None:
+            listen.close()
+            return
+        conn.settimeout(30)
         buf = b""
         try:
             while True:
@@ -1450,13 +1619,14 @@ def _loopback():
         listen.listen(4)
         https_box.append(listen.getsockname()[1])
         https_ready.set()
-        listen.settimeout(20)
+        deadline = time.time() + 60
+        listen.settimeout(1)
         try:
-            while True:
+            while time.time() < deadline:
                 try:
                     conn, _addr = listen.accept()
                 except socket.timeout:
-                    break
+                    continue
                 try:
                     ssock = ctx.wrap_socket(conn, server_side=True)
                 except ssl.SSLError:
@@ -1500,14 +1670,337 @@ def _loopback():
     threading.Thread(target=serve_http, daemon=True).start()
     threading.Thread(target=serve_https, daemon=True).start()
     assert http_ready.wait(5) and https_ready.wait(5)
-    threading.Thread(target=feed, daemon=True).start()
     cert, key = make_cert("proxy-loop")
+    threading.Thread(target=feed, daemon=True).start()
     ok, detail = client_pair("127.0.0.1", "9999", cert, key, http_box[0], https_box[0])
     assert ok, detail
     saved = store.client_for_der(
         x509.load_pem_x509_certificate(cert.encode()).public_bytes(serialization.Encoding.DER)
     )
     assert saved and saved["gsuser"] == "gsuser9"
+
+
+def _free_base():
+    offsets = {
+        -5: (socket.SOCK_STREAM,),
+        0: (socket.SOCK_STREAM,),
+        9: (socket.SOCK_DGRAM,),
+        10: (socket.SOCK_DGRAM,),
+        11: (socket.SOCK_DGRAM,),
+        13: (socket.SOCK_DGRAM,),
+        21: (socket.SOCK_STREAM, socket.SOCK_DGRAM),
+    }
+    for base in range(25000, 42000, 37):
+        held = []
+        try:
+            for off, kinds in offsets.items():
+                for kind in kinds:
+                    sock = socket.socket(socket.AF_INET, kind)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock.bind(("0.0.0.0", base + off))
+                    held.append(sock)
+        except OSError:
+            for sock in held:
+                sock.close()
+            continue
+        for sock in held:
+            sock.close()
+        return base
+    raise SystemExit("no free sunshine port block")
+
+
+def _wait_port(port):
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=0.2)
+            sock.close()
+            return
+        except OSError:
+            time.sleep(0.05)
+    raise SystemExit(f"port {port} did not open")
+
+
+def _read_one(sock):
+    sock.settimeout(5)
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return buf
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    length = 0
+    for line in head.split(b"\r\n"):
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1].strip())
+    while len(rest) < length:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        rest += chunk
+    return head + b"\r\n\r\n" + rest[:length]
+
+
+def _flow_test():
+    """Moonlight pair, then a seat that answers with its own pod address.
+
+    The client cert is self-signed, which is what Moonlight sends. The seat
+    trusts the proxy cert seat-boot installed. The client must see its own
+    host in LocalIP and the RTSP url, then a RST when the seat moves.
+    """
+    import importlib.util
+    import tempfile
+    from types import SimpleNamespace
+
+    seat_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "image", "seat-boot.py")
+    spec = importlib.util.spec_from_file_location("seat_boot_flow", seat_path)
+    seat_boot = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(seat_boot)
+
+    base = _free_base()
+    home = tempfile.mkdtemp()
+    cfg = SimpleNamespace(
+        proxy_store=os.path.join(home, "store.json"),
+        proxy_cert_publish=os.path.join(home, "proxy-client.crt"),
+        sunshine_base=base,
+        https_offset=-5,
+        web_offset=1,
+        rtsp_offset=21,
+        udp_offsets=(9, 10, 11, 13, 21),
+        ready_timeout=3,
+        http_foreign="redirect",
+        persist_mount=home,
+        sunshine_config_rel=".config/sunshine",
+        sunshine_state_file="sunshine_state.json",
+        secret=b"0123456789abcdef",
+        admin_password="",
+    )
+
+    class User:
+        def __init__(self, name):
+            self.name = name
+
+    class Directory:
+        def __init__(self):
+            self.users = {"gsuser9": User("gsuser9")}
+
+        def get(self, name):
+            return self.users.get(name)
+
+    class Place:
+        def __init__(self):
+            self.kind = "local"
+            self.info = "127.0.0.1"
+            self.proxy_host = "4.4.4.4"
+            self.node = "node-a"
+
+    class Seats:
+        def __init__(self):
+            self.place = Place()
+
+        def lookup(self, user):
+            return self.place if user is not None else None
+
+        def ensure(self, user):
+            return self.place
+
+        def touch(self, name):
+            return None
+
+    seats = Seats()
+    proxy = MoonlightProxy(cfg, Directory(), seats)
+    updates, paired = seat_boot.apply_boot(
+        os.path.join(home, "sunshine.conf"),
+        os.path.join(home, "gsuser9", ".config", "sunshine", "sunshine_state.json"),
+        {
+            "SUNSHINE_BASE_PORT": str(base),
+            "GS_PROXY_CERT": cfg.proxy_cert_publish,
+            "GS_PROXY_CERT_REQUIRED": "1",
+            "GS_PROXY_CERT_WAIT": "1",
+            "GS_PROXY_CLIENT_NAME": "gs-proxy",
+        },
+    )
+    assert paired, "seat-boot did not install the proxy cert"
+    assert updates["file_state"].endswith("sunshine_state.json")
+    installed = json.load(open(os.path.join(
+        home, "gsuser9", ".config", "sunshine", "sunshine_state.json"
+    )))
+    installed_pem = installed["root"]["named_devices"][0]["cert"]
+    assert installed["root"]["named_devices"][0]["enabled"] is True
+    assert fingerprint(installed_pem) == fingerprint(proxy.store.server_material()[0])
+
+    fake_port = _fake_sunshine(installed_pem)
+    real_backend = MoonlightProxy._backend
+
+    def backend(pod_ip, gsuser, _port=fake_port):
+        saved = proxy.ports["https"]
+        proxy.ports["https"] = _port
+        try:
+            return real_backend(proxy, pod_ip, gsuser)
+        finally:
+            proxy.ports["https"] = saved
+
+    proxy._backend = backend
+    proxy.start()
+    _wait_port(proxy.ports["http"])
+
+    def feed():
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if proxy.store.snapshot()["pending"]:
+                def save(data):
+                    for rec in data["pending"].values():
+                        if not rec.get("pin"):
+                            rec["pin"] = "2468"
+                            rec["gsuser"] = "gsuser9"
+                proxy.store.update(save)
+                return
+            time.sleep(0.05)
+
+    threading.Thread(target=feed, daemon=True).start()
+    cert, key = make_cert("moonlight-phone")
+    ok, detail = client_pair("127.0.0.1", "2468", cert, key, proxy.ports["http"], proxy.ports["https"])
+    assert ok, detail
+    other_cert, other_key = make_cert("someone-else")
+    try:
+        _tls_exchange(proxy.ports["https"], other_cert, other_key, "/serverinfo", "5.5.5.5")
+        raise SystemExit("unpaired client certificate was accepted")
+    except (ssl.SSLError, OSError):
+        pass
+
+    info, err = _tls_exchange(proxy.ports["https"], cert, key, "/serverinfo", "5.5.5.5:47984")
+    assert err is None, err
+    assert b"<LocalIP>5.5.5.5</LocalIP>" in info
+    assert b"10.9.9.9" not in info
+    assert b"<currentgame>7</currentgame>" in info
+    uid = proxy.store.server_material()[2]
+    assert f"<uniqueid>{uid}</uniqueid>".encode() in info
+    launch, err = _tls_exchange(proxy.ports["https"], cert, key, "/launch?appid=1", "5.5.5.5")
+    assert err is None, err
+    assert b"rtsp://5.5.5.5:48010" in launch
+    assert b"rtspenc://5.5.5.5:48010" in launch
+    assert b"<currentgame>7</currentgame>" in launch
+    assert b"10.9.9.9" not in launch
+
+    seats.place.kind = "remote"
+    seats.place.info = ""
+    pointed, err = _tls_exchange(proxy.ports["https"], cert, key, "/serverinfo", "5.5.5.5")
+    assert err is None, err
+    assert b"<LocalIP>4.4.4.4</LocalIP>" in pointed
+    assert b"<ExternalIP>4.4.4.4</ExternalIP>" in pointed
+    try:
+        again, _err = _tls_exchange(proxy.ports["https"], cert, key, "/serverinfo", "5.5.5.5")
+    except OSError:
+        again = b""
+    assert b"<LocalIP>" not in again
+    _reset_check(proxy.ports["https"], cert, key)
+
+
+def _fake_sunshine(trust_pem):
+    cert, key = make_cert("seat-sunshine")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(_write_temp(cert), _write_temp(key))
+    ctx.verify_mode = ssl.CERT_OPTIONAL
+    text = trust_pem if str(trust_pem).endswith("\n") else str(trust_pem) + "\n"
+    ctx.load_verify_locations(cadata=text)
+    listen = socket.socket()
+    listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listen.bind(("127.0.0.1", 0))
+    listen.listen(8)
+    port = listen.getsockname()[1]
+
+    def serve():
+        while True:
+            try:
+                conn, _addr = listen.accept()
+            except OSError:
+                return
+            try:
+                ssock = ctx.wrap_socket(conn, server_side=True)
+                ssock.settimeout(5)
+                raw, _rest = read_http(ssock, b"")
+                if raw is None:
+                    ssock.close()
+                    continue
+                line = raw.split(b"\r\n", 1)[0].decode("iso-8859-1", "replace")
+                path = line.split(" ")[1]
+                if path.startswith("/launch"):
+                    body = (
+                        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                        "<root status_code=\"200\">"
+                        "<sessionUrl0>rtsp://10.9.9.9:48010</sessionUrl0>"
+                        "<sessionUrl1>rtspenc://10.9.9.9:48010</sessionUrl1>"
+                        "<currentgame>7</currentgame></root>"
+                    ).encode()
+                else:
+                    body = (
+                        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+                        "<root status_code=\"200\"><uniqueid>SEATUNIQUEID</uniqueid>"
+                        "<LocalIP>10.9.9.9</LocalIP><PairStatus>1</PairStatus>"
+                        "<currentgame>7</currentgame></root>"
+                    ).encode()
+                ssock.sendall(http_response(body, b"application/xml"))
+                ssock.close()
+            except OSError:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    return port
+
+
+def _tls_exchange(port, cert, key, path, host):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_cert_chain(_write_temp(cert), _write_temp(key))
+    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+    ssock = ctx.wrap_socket(raw, server_hostname="sunshine")
+    ssock.sendall(
+        f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode()
+    )
+    try:
+        return _read_one(ssock), None
+    except ConnectionResetError:
+        raise
+    finally:
+        try:
+            ssock.close()
+        except OSError:
+            pass
+
+
+def _reset_check(port, cert, key):
+    """The foreign reset has to be a TCP RST, not a TLS close_notify."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.load_cert_chain(_write_temp(cert), _write_temp(key))
+    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+    ssock = ctx.wrap_socket(raw, server_hostname="sunshine")
+    ssock.sendall(b"GET /serverinfo HTTP/1.1\r\nHost: 5.5.5.5\r\nConnection: close\r\n\r\n")
+    probe = socket.fromfd(ssock.fileno(), socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(3)
+    try:
+        while True:
+            data = probe.recv(2048)
+            if not data:
+                raise SystemExit("foreign seat closed with FIN, Moonlight would keep this address")
+    except ConnectionResetError:
+        return
+    finally:
+        try:
+            probe.close()
+        except OSError:
+            pass
+        try:
+            ssock.close()
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

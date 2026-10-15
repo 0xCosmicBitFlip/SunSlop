@@ -161,6 +161,20 @@ python3 /usr/local/bin/seat-boot.py --conf "$conf" --state "$state"
 chown "${user}:${user}" "$conf" "$state" || true
 chown -R "${user}:${user}" "${home}/${config_rel}" || true
 
+# Sunshine's appdata is ${XDG_CONFIG_HOME}/sunshine, not the process cwd.
+case "${config_rel}" in
+  */sunshine)
+    xdg_config="${home}/${config_rel%/sunshine}"
+    xdg_config="${xdg_config%/}"
+    ;;
+  sunshine)
+    xdg_config="${home}"
+    ;;
+  *)
+    xdg_config="${home}/.config"
+    ;;
+esac
+
 export GS_USER="$user" GS_HOME="$home"
 export GS_DNF_CACHEDIR="$layer/dnf-cache"
 export GS_LAYER_MANIFEST="$layer/installed.list"
@@ -176,6 +190,7 @@ sed \
   -e "s#@SELKIES_ENCODER@#${encoder}#g" \
   -e "s#@SELKIES_PORT@#${selkies_port}#g" \
   -e "s#@SELKIES_ADDR@#${selkies_addr}#g" \
+  -e "s#@XDG_CONFIG_HOME@#${xdg_config}#g" \
   /tmp/gs-supervisord.in > /run/gs-supervisord.conf
 if grep -q '@[A-Z_]*@' /run/gs-supervisord.conf; then
   echo "supervisord template still has placeholders" >&2
