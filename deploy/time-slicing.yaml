@@ -1,0 +1,20 @@
+# Optional. Does nothing until the GPU Operator device plugin is pointed at
+# this ConfigMap (devicePlugin.config.name=gamestream-time-slicing,
+# devicePlugin.config.default=any). Replicas come from SESSIONS_PER_GPU.
+# The orchestrator will not place one more seat than that on a GPU it counts as full.
+# Apply with: python3 deploy/render.py --time-slicing
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gamestream-time-slicing
+  namespace: ${GPU_OPERATOR_NAMESPACE}
+data:
+  any: |
+    version: v1
+    sharing:
+      timeSlicing:
+        renameByDefault: false
+        failRequestsGreaterThanOne: false
+        resources:
+          - name: nvidia.com/gpu
+            replicas: ${SESSIONS_PER_GPU}

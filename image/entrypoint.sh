@@ -1,0 +1,185 @@
+#!/bin/bash
+# Root in the guest. The desktop session runs as GS_USER (uid GS_UID).
+# Those values, the home, and the layer mount come from the seat env, which
+# the orchestrator copies out of the gs-config ConfigMap.
+#
+# Extra RPMs persist in the shared layer directory, not in a home.
+# The CRI-O root is CephFS through FUSE, and kata shows that to the guest as
+# virtio-fs. Kernel overlay cannot use either as an upper directory, so the
+# layer is a real directory of files and this script bind-mounts it. CephFS
+# flock keeps two seats from seeding or running dnf at the same time.
+# Personal installs belong under the home directory, not in this tree.
+set -euo pipefail
+
+user="${GS_USER:-gsuser}"
+uid="${GS_UID:-1000}"
+gid="${GS_GID:-1000}"
+home="${GS_HOME:-/home/${user}}"
+runtime="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
+wayland="${WAYLAND_DISPLAY:-wayland-0}"
+layer="${GS_LAYER:-/gs-layer}"
+encoder="${SELKIES_ENCODER:-nvh264enc}"
+selkies_port="${SELKIES_PORT:-8082}"
+selkies_addr="${SELKIES_ADDR:-0.0.0.0}"
+config_rel="${SUNSHINE_CONFIG_REL:-.config/sunshine}"
+
+case "${user}${uid}${gid}${wayland}${encoder}${selkies_port}${selkies_addr}" in
+  *[!a-zA-Z0-9_.:-]*)
+    echo "seat identity has an unsafe character" >&2
+    exit 1
+    ;;
+esac
+case "${home}${runtime}${layer}${config_rel}" in
+  *[!a-zA-Z0-9_./-]*)
+    echo "seat path has an unsafe character" >&2
+    exit 1
+    ;;
+esac
+
+install -d -o root -g root -m 0755 /run /var/log
+install -d -m 0700 "${runtime}" "${home}"
+
+if [[ ! -e /dev/uinput ]]; then
+  modprobe uinput 2>/dev/null || true
+fi
+if [[ ! -e /dev/uinput ]]; then
+  major="$(awk '$2=="uinput"{print $1}' /proc/devices || true)"
+  if [[ -n "${major}" ]]; then
+    mknod -m 0660 /dev/uinput c "${major}" 223
+  fi
+fi
+if [[ -e /dev/uinput ]]; then
+  group="$(getent group input | cut -d: -f1 || true)"
+  if [[ -n "${group}" ]]; then
+    chgrp "${group}" /dev/uinput || true
+  fi
+  chmod 0660 /dev/uinput || true
+fi
+
+case "$layer" in
+  /usr|/usr/*|/etc|/etc/*)
+    echo "layer: ${layer} must not live inside /usr or /etc" >&2
+    exit 1
+    ;;
+esac
+if [[ "${GS_LAYER_ALLOW_UNMOUNTED:-}" != 1 ]] && ! mountpoint -q "$layer"; then
+  echo "layer: ${layer} is not a mount, so the shared layer would vanish with the pod" >&2
+  exit 1
+fi
+
+install -d "$layer" "$layer/dnf-cache"
+snap="$(mktemp -d /tmp/gs-pod.XXXXXX)"
+for f in resolv.conf hosts hostname machine-id; do
+  if [[ -e "/etc/$f" ]]; then
+    cp -L "/etc/$f" "$snap/$f" 2>/dev/null || cp -a "/etc/$f" "$snap/$f" || true
+  fi
+done
+tpl=/etc/gamestream/supervisord.conf.in
+if [[ ! -f "$tpl" && -f /etc/supervisord.conf ]]; then
+  tpl=/etc/supervisord.conf
+fi
+if [[ ! -f "$tpl" ]]; then
+  echo "layer: missing supervisord template" >&2
+  exit 1
+fi
+cp -a "$tpl" /tmp/gs-supervisord.in
+if [[ -f "${layer}/packages.list" ]]; then
+  cp -a "${layer}/packages.list" /tmp/gs-packages.list
+elif [[ -f /etc/gamestream/packages.list ]]; then
+  cp -a /etc/gamestream/packages.list /tmp/gs-packages.list
+else
+  : > /tmp/gs-packages.list
+fi
+
+image_id="$(rpm -qa --qf '%{NEVRA}\n' | sort | sha256sum | awk '{print $1}')"
+exec 9>"$layer/lock"
+if ! flock 9; then
+  echo "layer: flock ${layer}/lock failed" >&2
+  exit 1
+fi
+
+if [[ ! -f "$layer/image-id" || "$(cat "$layer/image-id")" != "$image_id" ]]; then
+  echo "layer: seeding /usr and /etc from this image into ${layer}"
+  rm -rf "$layer/usr" "$layer/etc" "$layer/installed.list"
+  mkdir -p "$layer/usr" "$layer/etc"
+  cp -a /usr/. "$layer/usr/"
+  cp -a /etc/. "$layer/etc/"
+  printf '%s\n' "$image_id" > "$layer/image-id"
+  : > "$layer/installed.list"
+  echo "layer: seed done"
+fi
+
+mount --bind "$layer/usr" /usr
+mount --bind "$layer/etc" /etc
+for f in resolv.conf hosts hostname machine-id; do
+  if [[ -f "$snap/$f" ]]; then
+    if [[ -L "/etc/$f" ]]; then
+      rm -f "/etc/$f"
+      touch "/etc/$f"
+    fi
+    mount --bind "$snap/$f" "/etc/$f"
+  fi
+done
+echo "layer: bound ${layer}"
+
+# /etc is the shared layer after the bind, so the unix account is shared too.
+# Every seat uses the same GS_USER. Create it here if this image did not.
+if ! getent group "$gid" >/dev/null && ! getent group "$user" >/dev/null; then
+  groupadd -g "$gid" "$user"
+elif ! getent group "$user" >/dev/null; then
+  gname="$(getent group "$gid" | cut -d: -f1)"
+  groupmod -n "$user" "$gname"
+fi
+if getent passwd "$user" >/dev/null; then
+  usermod -u "$uid" -g "$gid" -d "$home" "$user"
+elif getent passwd "$uid" >/dev/null; then
+  old="$(getent passwd "$uid" | cut -d: -f1)"
+  usermod -l "$user" -d "$home" "$old"
+  usermod -u "$uid" -g "$gid" "$user"
+else
+  useradd -u "$uid" -g "$gid" -d "$home" -M -s /bin/bash "$user"
+fi
+for g in render video input; do
+  getent group "$g" >/dev/null && usermod -aG "$g" "$user" || true
+done
+chown "${user}:${user}" "$runtime" "$home" || true
+
+install -d -o "$user" -g "$user" "${home}/.config/labwc" "${home}/${config_rel}"
+if [[ ! -e ${home}/.config/labwc/autostart ]]; then
+  install -o "$user" -g "$user" -m 0644 /etc/gamestream/labwc-autostart \
+    "${home}/.config/labwc/autostart"
+fi
+conf="${home}/${config_rel}/sunshine.conf"
+if [[ ! -e "$conf" ]]; then
+  install -o "$user" -g "$user" -m 0644 /etc/gamestream/sunshine.conf "$conf"
+fi
+export SUNSHINE_BASE_PORT="${SUNSHINE_BASE_PORT:-47989}"
+export SUNSHINE_STATE_FILE="${SUNSHINE_STATE_FILE:-sunshine_state.json}"
+export GS_PROXY_CLIENT_NAME="${GS_PROXY_CLIENT_NAME:-gs-proxy}"
+state="${home}/${config_rel}/${SUNSHINE_STATE_FILE}"
+python3 /usr/local/bin/seat-boot.py --conf "$conf" --state "$state"
+chown "${user}:${user}" "$conf" "$state" || true
+chown -R "${user}:${user}" "${home}/${config_rel}" || true
+
+export GS_USER="$user" GS_HOME="$home"
+export GS_DNF_CACHEDIR="$layer/dnf-cache"
+export GS_LAYER_MANIFEST="$layer/installed.list"
+export GS_PACKAGES_LIST=/tmp/gs-packages.list
+/usr/local/bin/ensure-packages.sh
+flock -u 9
+
+sed \
+  -e "s#@GS_USER@#${user}#g" \
+  -e "s#@GS_HOME@#${home}#g" \
+  -e "s#@XDG_RUNTIME_DIR@#${runtime}#g" \
+  -e "s#@WAYLAND_DISPLAY@#${wayland}#g" \
+  -e "s#@SELKIES_ENCODER@#${encoder}#g" \
+  -e "s#@SELKIES_PORT@#${selkies_port}#g" \
+  -e "s#@SELKIES_ADDR@#${selkies_addr}#g" \
+  /tmp/gs-supervisord.in > /run/gs-supervisord.conf
+if grep -q '@[A-Z_]*@' /run/gs-supervisord.conf; then
+  echo "supervisord template still has placeholders" >&2
+  exit 1
+fi
+
+exec /usr/bin/supervisord -c /run/gs-supervisord.conf

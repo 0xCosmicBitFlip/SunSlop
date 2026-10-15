@@ -1,0 +1,184 @@
+# One orchestrator, anywhere. It creates seats. It does not listen for
+# Moonlight. The public listeners are the ${PROXY_NAME} DaemonSet in proxy.yaml.
+#
+# Site values come from deploy/gs-config.yaml. Apply with:
+#   python3 deploy/render.py | kubectl apply -f -
+#
+# Moonlight dials the Sunshine ports on any proxy node. The client
+# certificate selects the user. If the seat is on another node, Moonlight is
+# given that node's address and then reset so it retries there. Selkies
+# is http on HTTP_PORT on the proxy. Put Traefik in front of Service/${PROXY_NAME}.
+# /admin on that same port pairs clients.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${NAMESPACE}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: ${RUNTIME_CLASS}
+handler: ${RUNTIME_CLASS}
+overhead:
+  podFixed:
+    cpu: "250m"
+    memory: 512Mi
+scheduling:
+  nodeSelector:
+    nvkvm.kata/ready: "true"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${ORCH_NAME}
+  namespace: ${NAMESPACE}
+---
+# pods only, this namespace only. delete is the idle action. There is no
+# pause verb; patch is what a later pause annotation would use.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ${ORCH_NAME}
+  namespace: ${NAMESPACE}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: ${ORCH_NAME}
+  namespace: ${NAMESPACE}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: ${ORCH_NAME}
+subjects:
+  - kind: ServiceAccount
+    name: ${ORCH_NAME}
+    namespace: ${NAMESPACE}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gs-users
+  namespace: ${NAMESPACE}
+data:
+  # username,password,external sunshine base
+  # CERT_PROXY=true (the default) ignores the base for routing. Every client
+  # dials SUNSHINE_BASE, and the client certificate selects the login. The
+  # base is only the listen span when CERT_PROXY=false. It must still not overlap.
+  # password is the Selkies login. Moonlight pairs at /admin, not with a pod.
+  users.csv: |
+    # username,password,base_port
+    # Logins only. The unix account inside the seat is SEAT_USER in gs-config.
+    # With CERT_PROXY=false the first base must be SUNSHINE_BASE, and each
+    # following base is that port plus n times USER_PORT_STRIDE
+    # (${USER_PORT_STRIDE}). A span is 27 ports. The stride must not overlap.
+    gsuser0,CHANGE_ME_selkies_password,${USER_BASE_0}
+    gsuser1,CHANGE_ME_selkies_password,${USER_BASE_1}
+    gsuser2,CHANGE_ME_selkies_password,${USER_BASE_2}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gs-cookie
+  namespace: ${NAMESPACE}
+type: Opaque
+stringData:
+  # Replace both before apply. cookie.secret is the HMAC key for gs_session
+  # and the orchestrator API. admin.password gates /admin. Neither is a
+  # login from users.csv.
+  cookie.secret: "CHANGE_ME_cookie_hmac_secret_at_least_32_random_bytes"
+  admin.password: "CHANGE_ME_admin_ui_password"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${ORCH_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: ${ORCH_NAME}
+  ports:
+    - name: http
+      port: ${HTTP_PORT}
+      targetPort: ${HTTP_PORT}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${ORCH_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  replicas: ${ORCH_REPLICAS}
+  selector:
+    matchLabels:
+      app: ${ORCH_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${ORCH_NAME}
+    spec:
+      serviceAccountName: ${ORCH_NAME}
+      containers:
+        - name: orchestrator
+          image: ${ORCH_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: ${HTTP_PORT}
+          envFrom:
+            - configMapRef:
+                name: gs-config
+          env:
+            - name: GS_ROLE
+              value: orchestrator
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: USERS_FILE
+              value: ${USERS_MOUNT}/users.csv
+            - name: COOKIE_SECRET_FILE
+              value: ${COOKIE_MOUNT}/cookie.secret
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gs-cookie
+                  key: admin.password
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: ${HTTP_PORT}
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          volumeMounts:
+            - name: users
+              mountPath: ${USERS_MOUNT}
+              readOnly: true
+            - name: cookie
+              mountPath: ${COOKIE_MOUNT}
+              readOnly: true
+            - name: persist
+              mountPath: ${PERSIST_MOUNT}
+      volumes:
+        - name: users
+          configMap:
+            name: gs-users
+        - name: cookie
+          secret:
+            secretName: gs-cookie
+        - name: persist
+          hostPath:
+            path: ${PERSIST_ROOT}
+            type: DirectoryOrCreate

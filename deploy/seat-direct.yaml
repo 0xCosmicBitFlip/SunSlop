@@ -1,0 +1,128 @@
+# Debug only. The orchestrator creates this pod itself. Apply with
+# `python3 deploy/render.py --seat` only when you want to talk to
+# a seat with no proxy in front, at the pod IP. Values come from gs-config.yaml.
+# Do not apply it for a login the orchestrator is also serving.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: gs-${SEAT_DIRECT_USER}
+  namespace: ${NAMESPACE}
+  labels:
+    app: ${SEAT_APP}
+    gamestream.local/user: ${SEAT_DIRECT_USER}
+    gamestream.local/gpu: "${SEAT_DIRECT_GPU}"
+spec:
+  restartPolicy: Never
+  runtimeClassName: ${RUNTIME_CLASS}
+  terminationGracePeriodSeconds: 15
+  containers:
+    - name: desktop
+      image: ${SEAT_IMAGE}
+      imagePullPolicy: IfNotPresent
+      env:
+        - name: SUNSHINE_BASE_PORT
+          value: "${SUNSHINE_BASE}"
+        - name: SUNSHINE_HTTPS_PORT
+          value: "${SUNSHINE_HTTPS_PORT}"
+        - name: SUNSHINE_WEB_PORT
+          value: "${SUNSHINE_WEB_PORT}"
+        - name: SUNSHINE_RTSP_PORT
+          value: "${SUNSHINE_RTSP_PORT}"
+        - name: SUNSHINE_UDP_PORTS
+          value: "${SUNSHINE_UDP_PORTS}"
+        - name: SUNSHINE_HTTPS_OFFSET
+          value: "${SUNSHINE_HTTPS_OFFSET}"
+        - name: SUNSHINE_WEB_OFFSET
+          value: "${SUNSHINE_WEB_OFFSET}"
+        - name: SUNSHINE_RTSP_OFFSET
+          value: "${SUNSHINE_RTSP_OFFSET}"
+        - name: SUNSHINE_UDP_OFFSETS
+          value: "${SUNSHINE_UDP_OFFSETS}"
+        - name: SUNSHINE_BIND
+          value: "${SUNSHINE_BIND}"
+        - name: SUNSHINE_ADDRESS_FAMILY
+          value: "${SUNSHINE_ADDRESS_FAMILY}"
+        - name: SUNSHINE_ORIGIN_WEB_UI
+          value: "${SUNSHINE_ORIGIN_WEB_UI}"
+        - name: SUNSHINE_STATE_FILE
+          value: "${SUNSHINE_STATE_FILE}"
+        - name: SUNSHINE_CONFIG_REL
+          value: "${SUNSHINE_CONFIG_REL}"
+        - name: GS_PROXY_CERT
+          value: "${PROXY_CERT_MOUNT}"
+        - name: GS_PROXY_CLIENT_NAME
+          value: "${PROXY_CLIENT_NAME}"
+        - name: GS_PROXY_CERT_REQUIRED
+          value: "${PROXY_CERT_REQUIRED}"
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "${SEAT_DIRECT_GPU}"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: ${NVIDIA_DRIVER_CAPABILITIES}
+        - name: SELKIES_ENCODER
+          value: ${SELKIES_ENCODER}
+        - name: SELKIES_PORT
+          value: "${SELKIES_PORT}"
+        - name: SELKIES_ADDR
+          value: "${SELKIES_ADDR}"
+        - name: GS_USER
+          value: ${SEAT_USER}
+        - name: GS_UID
+          value: "${SEAT_UID}"
+        - name: GS_GID
+          value: "${SEAT_GID}"
+        - name: GS_HOME
+          value: ${SEAT_HOME}
+        - name: GS_LAYER
+          value: ${LAYER_MOUNT}
+        - name: GS_COMMON
+          value: ${COMMON_MOUNT}
+        - name: XDG_RUNTIME_DIR
+          value: ${XDG_RUNTIME_DIR}
+        - name: WAYLAND_DISPLAY
+          value: ${WAYLAND_DISPLAY}
+      securityContext:
+        runAsUser: 0
+        capabilities:
+          add: ["SYS_ADMIN"]
+      readinessProbe:
+        exec:
+          command: ["/bin/bash", "-lc", "test -S ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"]
+        initialDelaySeconds: 3
+        periodSeconds: 2
+        failureThreshold: 90
+      resources:
+        requests:
+          cpu: "${SEAT_CPU_REQUEST}"
+          memory: ${SEAT_MEMORY_REQUEST}
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: "${SEAT_CPU_LIMIT}"
+          memory: ${SEAT_MEMORY_LIMIT}
+          nvidia.com/gpu: "1"
+      volumeMounts:
+        - name: home
+          mountPath: ${SEAT_HOME}
+        - name: common
+          mountPath: ${COMMON_MOUNT}
+        - name: layer
+          mountPath: ${LAYER_MOUNT}
+        - name: proxy-cert
+          mountPath: ${PROXY_CERT_MOUNT}
+          readOnly: true
+  volumes:
+    - name: home
+      hostPath:
+        path: ${PERSIST_ROOT}/${SEAT_DIRECT_USER}
+        type: DirectoryOrCreate
+    - name: common
+      hostPath:
+        path: ${PERSIST_ROOT}/${COMMON_DIR}
+        type: DirectoryOrCreate
+    - name: layer
+      hostPath:
+        path: ${PERSIST_ROOT}/${LAYER_DIR}
+        type: DirectoryOrCreate
+    - name: proxy-cert
+      hostPath:
+        path: ${PERSIST_ROOT}/${PROXY_DIR}/${PROXY_CLIENT_CERT}
+        type: FileOrCreate

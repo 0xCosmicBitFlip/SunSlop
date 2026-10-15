@@ -1,0 +1,11 @@
+# Startup RPMs for every seat. One package name per line.
+# Applied to the shared layer (LAYER_MOUNT, host directory PERSIST_ROOT/LAYER_DIR
+# in deploy/gs-config.yaml), not to a home directory.
+# A name that is already installed is skipped. A name this file used to list,
+# and no longer does, is removed on the next boot.
+# An optional <layer>/packages.list replaces this file when it is present.
+# steam is special-cased: RPM Fusion nonfree is enabled first.
+# lutris
+# steam
+# mangohud
+# gamemode

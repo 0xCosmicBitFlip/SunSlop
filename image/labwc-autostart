@@ -1,0 +1,3 @@
+# labwc reads this as a shell script. A terminal is enough to configure the box
+# from the Selkies page when Moonlight is down. Right-click the desktop for the menu.
+foot &

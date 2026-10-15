@@ -1,0 +1,108 @@
+# One proxy per GPU node. hostNetwork publishes HTTP_PORT and the Sunshine
+# family on the node. Do not request nvidia.com/gpu: that would consume a seat.
+# nvidia.com/gpu.present only selects the nodes. This pod has no kube token.
+# It asks Service/${ORCH_NAME} to create seats.
+#
+# Moonlight that lands here while the seat is on another node is told that
+# node's address, then reset so it retries there. Selkies is redirected
+# (HTTP 307) unless HTTP_FOREIGN says otherwise. Apply with:
+#   python3 deploy/render.py | kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ${PROXY_NAME}
+  namespace: ${NAMESPACE}
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${PROXY_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    app: ${PROXY_NAME}
+  ports:
+    - name: http
+      port: ${HTTP_PORT}
+      targetPort: ${HTTP_PORT}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ${PROXY_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  selector:
+    matchLabels:
+      app: ${PROXY_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${PROXY_NAME}
+    spec:
+      serviceAccountName: ${PROXY_NAME}
+      automountServiceAccountToken: false
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+      containers:
+        - name: proxy
+          image: ${ORCH_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: ${HTTP_PORT}
+              hostPort: ${HTTP_PORT}
+          envFrom:
+            - configMapRef:
+                name: gs-config
+          env:
+            - name: GS_ROLE
+              value: proxy
+            - name: ORCH_URL
+              value: http://${ORCH_NAME}:${HTTP_PORT}
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: USERS_FILE
+              value: ${USERS_MOUNT}/users.csv
+            - name: COOKIE_SECRET_FILE
+              value: ${COOKIE_MOUNT}/cookie.secret
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: gs-cookie
+                  key: admin.password
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: ${HTTP_PORT}
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          volumeMounts:
+            - name: users
+              mountPath: ${USERS_MOUNT}
+              readOnly: true
+            - name: cookie
+              mountPath: ${COOKIE_MOUNT}
+              readOnly: true
+            - name: persist
+              mountPath: ${PERSIST_MOUNT}
+      volumes:
+        - name: users
+          configMap:
+            name: gs-users
+        - name: cookie
+          secret:
+            secretName: gs-cookie
+        - name: persist
+          hostPath:
+            path: ${PERSIST_ROOT}
+            type: DirectoryOrCreate

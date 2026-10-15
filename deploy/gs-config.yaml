@@ -1,0 +1,104 @@
+# The only file to edit for a deploy. Paths, the seat account, ports, images,
+# and sizes live here. Login names and Selkies passwords stay in users.csv.
+# Cookie and admin secrets stay in the gs-cookie Secret.
+#
+# Kubernetes cannot take a hostPath or a namespace from a ConfigMap by itself,
+# so render.py copies these values into orchestrator.yaml and proxy.yaml:
+#
+#   python3 deploy/render.py | kubectl apply -f -
+#
+# Do not kubectl-edit this ConfigMap on the cluster without rendering again.
+# The persist volume's hostPath has to stay the same string as PERSIST_ROOT.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gs-config
+  namespace: ${NAMESPACE}
+data:
+  NAMESPACE: "gamestream"
+  GPU_OPERATOR_NAMESPACE: "gpu-operator"
+  ORCH_IMAGE: "gs-orchestrator:local"
+  SEAT_IMAGE: "gamestream:local"
+  RUNTIME_CLASS: "nvkvm-kata"
+
+  # Host disk, the same shared filesystem on every proxy node and on the
+  # node that runs the orchestrator. A node-local empty directory mints a
+  # second certificate. Homes are PERSIST_ROOT/<login>.
+  PERSIST_ROOT: "/var/lib/gamestream/persistent"
+  # Where the orchestrator pod mounts PERSIST_ROOT. This is not a host path.
+  PERSIST_MOUNT: "/var/lib/gs-persist"
+  COMMON_DIR: "common"
+  LAYER_DIR: "gs-layer"
+  PROXY_DIR: "proxy"
+
+  # Unix account inside every seat. Login names in users.csv are different.
+  SEAT_USER: "gsuser"
+  SEAT_UID: "1000"
+  SEAT_GID: "1000"
+  SEAT_HOME: "/home/gsuser"
+  COMMON_MOUNT: "/games"
+  LAYER_MOUNT: "/gs-layer"
+  XDG_RUNTIME_DIR: "/run/user/1000"
+  WAYLAND_DISPLAY: "wayland-0"
+
+  GPU_COUNT: "2"
+  SESSIONS_PER_GPU: "8"
+  DEVICE_PLUGIN: "true"
+  SEAT_CPU_REQUEST: "2"
+  SEAT_MEMORY_REQUEST: "8Gi"
+  SEAT_CPU_LIMIT: "8"
+  SEAT_MEMORY_LIMIT: "16Gi"
+  KATA_MEMORY_MIB: "16384"
+
+  HTTP_PORT: "8080"
+  SELKIES_PORT: "8082"
+  SELKIES_ADDR: "0.0.0.0"
+  SUNSHINE_BASE: "47989"
+  # Sunshine only stores `port`. The family is that base plus these offsets.
+  # The proxy listens on the same numbers. Do not change the offsets unless
+  # the Sunshine build in the seat image does too.
+  SUNSHINE_HTTPS_OFFSET: "-5"
+  SUNSHINE_WEB_OFFSET: "1"
+  SUNSHINE_RTSP_OFFSET: "21"
+  SUNSHINE_UDP_OFFSETS: "9,10,11,13,21"
+  SUNSHINE_BIND: "0.0.0.0"
+  SUNSHINE_ADDRESS_FAMILY: "ipv4"
+  SUNSHINE_ORIGIN_WEB_UI: "lan"
+  SUNSHINE_STATE_FILE: "sunshine_state.json"
+  SUNSHINE_CONFIG_REL: ".config/sunshine"
+  IDLE_SECONDS: "600"
+  COOKIE_TTL: "2592000"
+  READY_TIMEOUT: "180"
+  # redirect: Selkies HTTP 307 to the owning proxy. Moonlight gets that
+  # proxy's address in serverinfo, then a reset so it retries there.
+  # reset: RST Moonlight; the browser gets the retry page.
+  # proxy: splice both through to the pod IP.
+  HTTP_FOREIGN: "redirect"
+  # Empty uses http://{host}:HTTP_PORT. Set https://{host} when Traefik
+  # terminates TLS on the proxy's public address.
+  PUBLIC_HTTP_BASE: ""
+  CERT_PROXY: "true"
+
+  ORCH_NAME: "gs-orchestrator"
+  PROXY_NAME: "gs-proxy"
+  SEAT_APP: "gamestream"
+  ORCH_REPLICAS: "1"
+  # users.csv example rows. Only matters when CERT_PROXY=false.
+  USER_PORT_STRIDE: "100"
+
+  USERS_MOUNT: "/etc/gamestream/users"
+  COOKIE_MOUNT: "/etc/gamestream/secret"
+  PROXY_CLIENT_NAME: "gs-proxy"
+  PROXY_CLIENT_CERT: "proxy-client.crt"
+  PROXY_CERT_MOUNT: "/etc/gamestream/proxy-client.crt"
+  PROXY_CERT_REQUIRED: "true"
+
+  NVIDIA_DRIVER_CAPABILITIES: "compute,utility,graphics,display,video"
+  SELKIES_ENCODER: "nvh264enc"
+  # Optional. Leave empty unless you expose Sunshine's own web UI.
+  SUNSHINE_WEB_USER: ""
+  SUNSHINE_WEB_PASSWORD: ""
+
+  # Debug pod from render.py --seat. A login from users.csv, not the unix account.
+  SEAT_DIRECT_USER: "gsuser0"
+  SEAT_DIRECT_GPU: "0"
