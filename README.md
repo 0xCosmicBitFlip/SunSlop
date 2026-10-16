@@ -219,8 +219,16 @@ cargo test --offline --manifest-path orchestrator/gs-relay/Cargo.toml
 
 | Path | Role |
 |---|---|
-| [orchestrator/orchestrator.py](orchestrator/orchestrator.py) | seats, placement, Selkies login, idle, orchestrator API |
-| [orchestrator/moonlight_proxy.py](orchestrator/moonlight_proxy.py) | Sunshine TLS, pairing, `/admin`, shared cert, relay control |
+| [orchestrator/orchestrator.py](orchestrator/orchestrator.py) | process entry: loads config, seats, Selkies, and the API |
+| [orchestrator/moonlight_proxy.py](orchestrator/moonlight_proxy.py) | process entry: `MoonlightProxy` and `Store` |
+| [orchestrator/gs/seats.py](orchestrator/gs/seats.py) | seat lifecycle: create, place, idle delete |
+| [orchestrator/gs/browser.py](orchestrator/gs/browser.py) | Selkies login and reverse proxy |
+| [orchestrator/gs/api.py](orchestrator/gs/api.py) | orchestrator HTTP API |
+| [orchestrator/gs/moonlight.py](orchestrator/gs/moonlight.py) | Sunshine TLS termination, HTTP reverse proxy, `/admin` |
+| [orchestrator/gs/pairing.py](orchestrator/gs/pairing.py) | Moonlight pairing phases |
+| [orchestrator/gs/protocol.py](orchestrator/gs/protocol.py) | serverinfo XML, pairing crypto, address rewrite |
+| [orchestrator/gs/store.py](orchestrator/gs/store.py) | paired clients and the shared proxy certificate |
+| [orchestrator/gs/relay.py](orchestrator/gs/relay.py) | starts the Rust UDP/RTSP relay |
 | [orchestrator/gs-relay](orchestrator/gs-relay) | UDP and RTSP data plane, compiled on the proxy at start |
 | [deploy/gs-config.yaml](deploy/gs-config.yaml) | site paths, account, ports, images |
 | [deploy/render.py](deploy/render.py) | copies the ConfigMap into the other manifests |

@@ -6,6 +6,7 @@ FROM fedora:44
 RUN dnf -y install python3 python3-cryptography rust cargo gcc && dnf clean all
 COPY orchestrator/orchestrator.py /usr/local/bin/orchestrator.py
 COPY orchestrator/moonlight_proxy.py /usr/local/bin/moonlight_proxy.py
+COPY orchestrator/gs /usr/local/bin/gs
 COPY orchestrator/gs-relay /usr/local/src/gs-relay
 COPY orchestrator/relay-build.sh /usr/local/bin/relay-build.sh
 COPY orchestrator/entrypoint.sh /usr/local/bin/gs-entrypoint
