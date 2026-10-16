@@ -27,6 +27,7 @@ button { font: inherit; padding: .4rem; }
 <p class="err">{error}</p>
 <label>User <input name="username" autocomplete="username" required></label>
 <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+{next}
 <button type="submit">Continue</button>
 </form>
 """
@@ -37,6 +38,19 @@ RETRY_PAGE = """<!doctype html>
 <title>other node</title>
 <p>This seat is on another node. Retrying.</p>
 """
+
+
+def _next_path(raw):
+    if raw == "/pair":
+        return "/pair"
+    return "/"
+
+
+def _login_page(error, nxt="/"):
+    hidden = ""
+    if nxt == "/pair":
+        hidden = '<input type="hidden" name="next" value="/pair">'
+    return LOGIN_PAGE.format(error=error, next=hidden)
 
 
 class App:
@@ -234,7 +248,7 @@ class App:
                     self._login()
                     return
                 if path == "/login":
-                    self._page(200, LOGIN_PAGE.format(error=""))
+                    self._page(200, _login_page(""))
                     return
                 if path == "/saml/acs":
                     self._saml()
@@ -243,8 +257,17 @@ class App:
                     self._page(200, "ok\n", "text/plain")
                     return
                 user = self._session_user()
+                if path == "/pair" or path.startswith("/pair/"):
+                    if app.moon is None:
+                        self._page(404, "certificate proxy is off\n", "text/plain")
+                        return
+                    if user is None:
+                        self._page(401, _login_page("", "/pair"))
+                        return
+                    app.moon.handle_pair(self, user)
+                    return
                 if user is None:
-                    self._page(401, LOGIN_PAGE.format(error=""))
+                    self._page(401, _login_page(""))
                     return
                 self._open_seat(user)
 
@@ -270,11 +293,13 @@ class App:
                 password = (form.get("password") or [""])[0]
                 user = app.directory.authenticate(username, password)
                 if user is None:
-                    self._page(401, LOGIN_PAGE.format(error="Unknown user or password."))
+                    nxt = _next_path((form.get("next") or [""])[0])
+                    self._page(401, _login_page("Unknown user or password.", nxt))
                     return
+                nxt = _next_path((form.get("next") or [""])[0])
                 self.send_response(302)
                 self._send_cookie(user.name)
-                self.send_header("Location", "/")
+                self.send_header("Location", nxt or "/")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 

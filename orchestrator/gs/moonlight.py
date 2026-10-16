@@ -1,4 +1,4 @@
-"""TLS front end, plain-HTTP pairing port, and /admin."""
+"""TLS front end, plain-HTTP pairing port, Selkies /pair, and /admin."""
 import hmac
 import json
 import os
@@ -9,7 +9,7 @@ import time
 import urllib.parse
 from hashlib import sha256
 
-from gs.pairing import PairServer
+from gs.pairing import PairServer, claim_pin, unpair_own
 from gs.protocol import (
     HTTPS_OFFSET,
     PIN_WAIT,
@@ -380,13 +380,39 @@ class MoonlightProxy:
         path = urllib.parse.urlsplit(handler.path).path
         if not self._admin_ok(handler, path):
             return
-        if path == "/admin/pin" and handler.command == "POST":
-            self._post_pin(handler)
+        handler._page(200, self._admin_page(), "text/html; charset=utf-8")
+
+    def handle_pair(self, handler, user):
+        path = urllib.parse.urlsplit(handler.path).path
+        if path == "/pair/remove" and handler.command == "POST":
+            fp = _form(handler).get("fingerprint", [""])[0]
+            unpair_own(self.store, user.name, fp)
+            self._redirect(handler, "/pair")
             return
-        if path == "/admin/unpair" and handler.command == "POST":
-            self._post_unpair(handler)
+        if path == "/pair" and handler.command == "POST":
+            form = _form(handler)
+            err = claim_pin(
+                self.store,
+                form.get("uniqueid", [""])[0],
+                form.get("pin", [""])[0],
+                user.name,
+            )
+            notice = {
+                "": "PIN accepted. Moonlight finishes on its own.",
+                "pin": "The PIN is the four digits on the Moonlight client.",
+                "taken": "That client is already being paired by someone else.",
+                "none": "That client is not waiting. Start pairing in Moonlight, then refresh.",
+                "missing": "That client is not waiting. Start pairing in Moonlight, then refresh.",
+            }.get(err, "Could not pair.")
+            handler._page(200 if err == "" else 400, self._pair_page(user, notice), "text/html; charset=utf-8")
             return
-        handler._page(200, self._page(), "text/html; charset=utf-8")
+        handler._page(200, self._pair_page(user, ""), "text/html; charset=utf-8")
+
+    def _redirect(self, handler, loc):
+        handler.send_response(302)
+        handler.send_header("Location", loc)
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
 
     def _admin_token(self):
         return hmac.new(self.cfg.secret, b"gs-admin\0" + self.cfg.admin_password.encode(), sha256).hexdigest()
@@ -417,86 +443,123 @@ class MoonlightProxy:
         handler._page(401, "<form method=post action=/admin/login><input type=password name=password><button>Admin</button></form>")
         return False
 
-    def _page(self):
-        data = self.store.snapshot()
-        rows = []
-        for client in data["clients"]:
-            rows.append(
-                f"<tr><td>{_e(client.get('name'))}</td><td>{_e(client.get('gsuser'))}</td>"
-                f"<td><code>{client.get('fingerprint','')[:16]}</code></td>"
-                f"<td><form method=post action=/admin/unpair><input type=hidden name=fingerprint value='{client.get('fingerprint','')}'>"
-                f"<button>Remove</button></form></td></tr>"
+    def _admin_page(self):
+        status = {}
+        if self.seats is not None and hasattr(self.seats, "status"):
+            try:
+                status = self.seats.status() or {}
+            except Exception as exc:
+                status = {"error": str(exc)[:200]}
+        board = status.get("orchestrator") or {}
+        beats = []
+        for beat in board.get("heartbeats") or []:
+            age = beat.get("age")
+            age_s = "" if age is None else f"{age}s"
+            beats.append(
+                f"<tr><td>{_e(beat.get('id'))}</td><td>{_e(beat.get('ordinal'))}</td><td>{_e(age_s)}</td></tr>"
             )
+        seats = []
+        for seat in status.get("seats") or []:
+            idle = seat.get("idle")
+            idle_s = "" if idle is None else f"{idle}s"
+            seats.append(
+                "<tr>"
+                f"<td>{_e(seat.get('user'))}</td>"
+                f"<td>{_e(seat.get('phase'))}</td>"
+                f"<td>{'yes' if seat.get('ready') else 'no'}</td>"
+                f"<td>{_e(seat.get('node'))}</td>"
+                f"<td>{_e(seat.get('ip'))}</td>"
+                f"<td>{_e(seat.get('gpu'))}</td>"
+                f"<td>{_e(seat.get('owner'))}</td>"
+                f"<td>{_e(idle_s)}</td>"
+                "</tr>"
+            )
+        data = self.store.snapshot()
         pending = []
-        for rec in data["pending"].values():
-            if rec.get("phase") == "wait-pin" or not rec.get("pin"):
-                opts = "".join(
-                    f"<option value='{_e(name)}'>{_e(name)}</option>" for name in sorted(self.directory.users)
-                )
-                pending.append(
-                    f"<li>{_e(rec.get('name'))} "
-                    f"<form method=post action=/admin/pin>PIN <input name=pin size=4 required> "
-                    f"<input type=hidden name=uniqueid value='{_e(rec.get('uniqueid'))}'>"
-                    f"<select name=gsuser>{opts}</select> <button>Pair</button></form></li>"
-                )
+        now = int(time.time())
+        for rec in (data.get("pending") or {}).values():
+            age = now - int(rec.get("created") or now)
+            pending.append(
+                f"<li>{_e(rec.get('name'))} user={_e(rec.get('gsuser') or '-')} "
+                f"phase={_e(rec.get('phase'))} age={age}s</li>"
+            )
+        clients = []
+        for client in data.get("clients") or []:
+            clients.append(
+                f"<tr><td>{_e(client.get('name'))}</td><td>{_e(client.get('gsuser'))}</td>"
+                f"<td><code>{_e((client.get('fingerprint') or '')[:16])}</code></td></tr>"
+            )
         cert = data.get("server_cert") or ""
-        pods = []
+        trust = []
         root = self._state_root()
         kwargs = self._state_kwargs()
         for name in sorted(self.directory.users):
             state = state_has_cert(root, name, cert, **kwargs) if cert else None
             state_s = {True: "proxy cert installed", False: "not in sunshine_state.json", None: "no state file"}.get(state, "")
-            pods.append(f"<li><b>{_e(name)}</b> {_e(state_s)}</li>")
-        fp = ""
+            trust.append(f"<li><b>{_e(name)}</b> {_e(state_s)}</li>")
         try:
             fp = fingerprint(cert)[:16] if cert else ""
         except Exception:
             fp = ""
+        err = status.get("error") or board.get("error") or ""
+        ready = "yes" if board.get("ready") else "no"
         return f"""<!doctype html>
 <meta charset="utf-8"><title>gs admin</title>
-<style>body{{font:15px sans-serif;background:#111;color:#eee}} code{{color:#9cf}} button{{cursor:pointer}}</style>
-<h1>Moonlight proxy</h1>
-<p>Clients pair here. Seats trust one shared proxy certificate, generated on first start and installed at seat boot. Pods stay on the configured Sunshine ports.</p>
-<p>Shared proxy cert <code>{_e(fp)}</code></p>
-<h2>Waiting for a PIN</h2>
+<style>body{{font:15px sans-serif;background:#111;color:#eee}} code{{color:#9cf}} td,th{{padding:.2rem .5rem;text-align:left}}</style>
+<h1>Debug</h1>
+<p>This page does not change anything. Reload to refresh.</p>
+<p>Proxy node <code>{_e(getattr(self.cfg, 'node', ''))}</code>.
+Orchestrator <code>{_e(board.get('id'))}</code> inventory {ready}.
+Shared cert <code>{_e(fp)}</code></p>
+{f'<p>{_e(err)}</p>' if err else ''}
+<h2>Orchestrators</h2>
+<table><tr><th>id</th><th>ordinal</th><th>heartbeat age</th></tr>{''.join(beats) or '<tr><td>none</td></tr>'}</table>
+<h2>Seats</h2>
+<table><tr><th>user</th><th>phase</th><th>ready</th><th>node</th><th>ip</th><th>gpu</th><th>owner</th><th>idle</th></tr>{''.join(seats) or '<tr><td>none</td></tr>'}</table>
+<h2>Pairing in progress</h2>
 <ul>{''.join(pending) or '<li>none</li>'}</ul>
 <h2>Paired clients</h2>
-<table>{''.join(rows) or '<tr><td>none</td></tr>'}</table>
+<table>{''.join(clients) or '<tr><td>none</td></tr>'}</table>
 <h2>Seat trust</h2>
-<ul>{''.join(pods) or '<li>add users to users.csv</li>'}</ul>
+<ul>{''.join(trust) or '<li>none</li>'}</ul>
 """
 
-    def _post_pin(self, handler):
-        form = _form(handler)
-        uid = form.get("uniqueid", [""])[0]
-        pin = form.get("pin", [""])[0].strip()
-        gsuser = form.get("gsuser", [""])[0]
-        if gsuser not in self.directory.users or not pin.isdigit() or len(pin) != 4:
-            handler._page(400, "pin must be 4 digits and gsuser must exist\n", "text/plain")
-            return
-
-        def save(data):
-            rec = data["pending"].get(uid)
-            if rec:
-                rec["pin"] = pin
-                rec["gsuser"] = gsuser
-        self.store.update(save)
-        handler.send_response(302)
-        handler.send_header("Location", "/admin")
-        handler.send_header("Content-Length", "0")
-        handler.end_headers()
-
-    def _post_unpair(self, handler):
-        fp = _form(handler).get("fingerprint", [""])[0]
-
-        def save(data):
-            data["clients"] = [c for c in data["clients"] if c.get("fingerprint") != fp]
-        self.store.update(save)
-        handler.send_response(302)
-        handler.send_header("Location", "/admin")
-        handler.send_header("Content-Length", "0")
-        handler.end_headers()
-
+    def _pair_page(self, user, notice):
+        data = self.store.snapshot()
+        waiting = []
+        for rec in (data.get("pending") or {}).values():
+            if rec.get("phase") != "wait-pin" or (rec.get("pin") and rec.get("gsuser")):
+                continue
+            uid = rec.get("uniqueid") or ""
+            waiting.append(
+                f"<li>{_e(rec.get('name') or 'client')} "
+                f"<form method=post action=/pair>PIN <input name=pin size=4 maxlength=4 required> "
+                f"<input type=hidden name=uniqueid value='{_e(uid)}'> "
+                f"<button>Pair</button></form></li>"
+            )
+        mine = []
+        for client in data.get("clients") or []:
+            if client.get("gsuser") != user.name:
+                continue
+            fp = client.get("fingerprint") or ""
+            mine.append(
+                f"<li>{_e(client.get('name'))} <code>{_e(fp[:16])}</code> "
+                f"<form method=post action=/pair/remove><input type=hidden name=fingerprint value='{_e(fp)}'>"
+                f"<button>Remove</button></form></li>"
+            )
+        note = f"<p>{_e(notice)}</p>" if notice else ""
+        return f"""<!doctype html>
+<meta charset="utf-8"><title>pair</title>
+<style>body{{font:15px sans-serif;background:#111;color:#eee}} button{{cursor:pointer}}</style>
+<h1>Pair Moonlight</h1>
+<p>Signed in as <b>{_e(user.name)}</b>. Start pairing in Moonlight, then type the PIN from that client. The certificate is stored for this login only.</p>
+{note}
+<h2>Waiting</h2>
+<ul>{''.join(waiting) or '<li>none yet</li>'}</ul>
+<h2>This login</h2>
+<ul>{''.join(mine) or '<li>none</li>'}</ul>
+<p><a href="/">Back to the desktop</a></p>
+"""
 
 def push_sunshine_pin(pod_ip, pin, user, password, web_port=SUNSHINE_HTTP + WEB_OFFSET):
     body = json.dumps({"pin": pin, "name": "gs-proxy"}).encode()
@@ -534,7 +597,7 @@ def _same(a, b):
 
 
 def _e(value):
-    text = value or ""
+    text = "" if value is None else str(value)
     amp = chr(38)
     return (
         text.replace(amp, amp + "amp;")

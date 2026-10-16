@@ -51,7 +51,7 @@ Leave the port offsets alone unless you also change the Sunshine build in the se
 Edit [deploy/orchestrator.yaml](../deploy/orchestrator.yaml):
 
 - `users.csv`: one line per login, `username,password,base_port`. The password is the Selkies login. Usernames are lowercase, start with a letter, and are at most 40 characters. `common`, `gs-layer`, and `proxy` are not logins. With `CERT_PROXY=true` (the default) Moonlight does not use the port column; every client dials `SUNSHINE_BASE`.
-- `gs-cookie`: replace both strings. `cookie.secret` is the HMAC key for the browser cookie and for the proxy-to-orchestrator API, at least 16 bytes. `admin.password` is the `/admin` password. An empty admin password is refused at startup, because `/admin` would be open on the node.
+- `gs-cookie`: replace both strings. `cookie.secret` is the HMAC key for the browser cookie and for the proxy-to-orchestrator API, at least 16 bytes. `admin.password` is the `/admin` debug page password. An empty admin password is refused at startup, because `/admin` would be open on the node.
 
 ```bash
 python3 deploy/render.py --allow-placeholders >/dev/null   # still prints; do not apply this
@@ -235,11 +235,11 @@ With `SUNSHINE_BASE` 47989, open these from the client network to each proxy's `
 | 47989 | TCP | HTTP pairing and unpaired `serverinfo`. |
 | 47998, 47999, 48000, 48002, 48010 | UDP | Video, control, audio, the extra stream, and the RTSP UDP port. |
 | 48010 | TCP | RTSP. |
-| 8080 | TCP | Selkies and `/admin`, if a browser dials the front address directly. Traefik on the back network is the usual path, and it uses Service `gs-proxy` instead of this address. |
+| 8080 | TCP | Selkies, `/pair`, and `/admin`, if a browser dials the front address directly. Traefik on the back network is the usual path, and it uses Service `gs-proxy` instead of this address. |
 
 Do not publish 47990. That is Sunshine's own web UI, and only the seat listens.
 
-`/admin` pairs a Moonlight device to a login. Treat `admin.password` as a staff credential. Anyone who can open it can attach a client certificate to a user.
+`/admin` is a debug page. Reload to refresh. It does not pair a client. `admin.password` still gates it.
 
 Confirm the split after the first proxy is Running:
 
@@ -251,9 +251,9 @@ kubectl -n gamestream get pod -l app=gs-proxy -o jsonpath='{range .items[*]}{.sp
 
 ## 11. Pair
 
-1. In Moonlight, add the `cs1-resident` address of any proxy and start pairing. The PIN is on the client. The request waits up to 10 minutes. The node IP will not answer.
-2. Open `http://<front-address>:8080/admin` (or the Traefik URL on the back network), enter `admin.password`, type the four digits, and pick the login.
-3. The certificate is stored at `<PERSIST_ROOT>/proxy/store.json`. The public half is `<PERSIST_ROOT>/proxy/proxy-client.crt`. Every seat mounts that file and trusts it at boot. `/admin` shows whether each login's state file contains it.
+1. Sign in at `http://<front-address>:8080/pair` (or the Traefik URL on the back network) with the desktop password.
+2. In Moonlight, add the `cs1-resident` address of any proxy and start pairing. The PIN is on the client. The request waits up to 10 minutes. The node IP will not answer.
+3. Type those four digits on `/pair` next to that client. The certificate is stored for the signed-in login at `<PERSIST_ROOT>/proxy/store.json`. The public half is `<PERSIST_ROOT>/proxy/proxy-client.crt`. Every seat mounts that file and trusts it at boot. `/admin` shows whether each login's state file contains it. Several people can do this at once. Each PIN is applied only to the client that is showing it.
 4. Open the host in Moonlight. `applist` or launch is what creates the seat. A `serverinfo` poll does not. The seat's init container is the only writer of the shared package layer. The first one copies `/usr`, `/etc`, and `/opt` and may install RPMs, so the first connection can take most of `READY_TIMEOUT` (900 seconds). The desktop container then mounts `/usr` and `/opt` read-only and a private `/etc`. It has no `CAP_SYS_ADMIN`, so root in the seat cannot remount the layer or change `/games`. The pod is Ready when labwc's socket exists.
 5. An open Moonlight window keeps that seat up: the HTTPS `serverinfo` poll resets the idle timer. Closing Moonlight, with no browser session and no UDP, deletes the pod after `IDLE_SECONDS`. The home directory remains.
 

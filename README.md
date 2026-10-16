@@ -24,8 +24,8 @@ The proxy selects `nvidia.com/gpu.present=true` and `nvkvm.kata/ready=true`, and
 | Client | Where it connects | What happens |
 |---|---|---|
 | Moonlight | Any proxy's `cs1-resident` address, `SUNSHINE_BASE` and `SUNSHINE_BASE` + `SUNSHINE_HTTPS_OFFSET` | Pairing and unpaired `serverinfo` stay on the proxy. TLS is terminated, the client certificate selects the login, and a second TLS session to the seat presents the shared proxy certificate. A seat on another node is not spliced. |
-| Browser | Traefik to Service `gs-proxy` port `HTTP_PORT` (8080), on the back network | Password form, then a reverse proxy to that user's Selkies, only when the seat is on this proxy's node. |
-| Admin | `http://<front-address>:HTTP_PORT/admin`, or the Traefik URL | Type the PIN Moonlight is showing. Unpair a client. |
+| Browser | Traefik to Service `gs-proxy` port `HTTP_PORT` (8080), on the back network | Password form at `/`, then a reverse proxy to that user's Selkies, only when the seat is on this proxy's node. `/pair` is the same login and is where a Moonlight PIN is entered. |
+| Admin | `/admin` on that same port | Read-only debug. Reload to refresh. Orchestrator heartbeats, seat idle time, and which clients are paired. It does not pair a client. |
 
 ## Configure
 
@@ -38,7 +38,7 @@ Two values in that file are site paths, not secrets, and the committed defaults 
 | `NAMESPACE` | `gamestream` | Your namespace. |
 | `PERSIST_ROOT` | `/var/lib/gamestream/persistent` | The shared host directory. The same string on every node. |
 
-Logins and the Selkies passwords live in `users.csv` inside [deploy/orchestrator.yaml](deploy/orchestrator.yaml). The cookie HMAC key and the admin password live in the `gs-cookie` Secret in that same file. The committed values are placeholders. Replace them before `kubectl apply`. An empty `admin.password` leaves `/admin` open on the proxy.
+Logins and the Selkies passwords live in `users.csv` inside [deploy/orchestrator.yaml](deploy/orchestrator.yaml). The cookie HMAC key and the admin password live in the `gs-cookie` Secret in that same file. The committed values are placeholders. Replace them before `kubectl apply`. An empty `admin.password` leaves the debug page open on the proxy.
 
 ```
 username,password,sunshine_base_port
@@ -52,7 +52,7 @@ stringData:
   admin.password: "CHANGE_ME_admin_ui_password"
 ```
 
-`cookie.secret` must be at least 16 bytes. It is the HMAC key for the Selkies cookie and for the proxy-to-orchestrator API. `admin.password` only gates `/admin`. The admin cookie is an HMAC, not the password.
+`cookie.secret` must be at least 16 bytes. It is the HMAC key for the Selkies cookie and for the proxy-to-orchestrator API. `admin.password` only gates `/admin`. The admin cookie is an HMAC, not the password. `/admin` does not pair clients.
 
 The password column is the Selkies login. `Directory.authenticate` checks it. With `CERT_PROXY=true` (the default) Moonlight ignores the third column and always dials `SUNSHINE_BASE`. The column remains so `CERT_PROXY=false` can fall back to one external port span per user: base−5 through base+21, shifted onto the pod's Sunshine ports. Ranges must not overlap, and `USER_PORT_STRIDE` must be at least 27.
 
@@ -62,7 +62,7 @@ The password column is the Selkies login. `Directory.authenticate` checks it. Wi
 
 ## Pairing
 
-Moonlight pairs with the proxy, once. The PIN is shown on the client. While that request is held open, open `/admin` on any proxy, type the four digits, and pick the login. The client certificate is stored with that user. The store is `<PERSIST_ROOT>/<PROXY_DIR>/store.json`, mounted at `<PERSIST_MOUNT>/<PROXY_DIR>/store.json`, so any proxy can finish a pairing another proxy started.
+Moonlight pairs with the proxy, once, from `/pair`. Sign in with the same password as the desktop. Start pairing in Moonlight and type the four digits that client is showing. The certificate on that handshake is stored for the login in the cookie, not for a user picked from a list. Two people can do this at the same time: each PIN is applied only to the client that is waiting for it. A wrong PIN, or a PIN for a client someone else already claimed, does not move the certificate. Removing a client is on that same page and only removes one that is already on this login. The store is `<PERSIST_ROOT>/<PROXY_DIR>/store.json`, mounted at `<PERSIST_MOUNT>/<PROXY_DIR>/store.json`, so any proxy can finish a pairing another proxy started.
 
 There is one proxy keypair, not one per user. The first proxy or orchestrator to start generates it and leaves it in that store. The public PEM is written beside it as `PROXY_CLIENT_CERT` (`proxy-client.crt`, mode 0644). Every seat mounts that file read-only at `PROXY_CERT_MOUNT`. `seat-boot.py` installs it into `sunshine_state.json` under `PROXY_CLIENT_NAME` on every boot, replacing the previous cert of that name and keeping the device uuid. Do not pair a pod by hand, and do not mint a per-user pod certificate. `/admin` reports whether each login's state file contains the shared cert.
 

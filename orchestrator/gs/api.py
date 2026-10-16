@@ -89,6 +89,8 @@ class OrchestratorApi:
                     elif path == "/v1/owner":
                         url = api.seats.owner_url(body.get("node") or "")
                         self._json(200, {"url": url or ""})
+                    elif path == "/v1/status":
+                        self._json(200, api.seats.status())
                     else:
                         self._json(404, {"kind": "error", "detail": "not found"})
                 except Exception as exc:

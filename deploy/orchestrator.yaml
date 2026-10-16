@@ -9,8 +9,10 @@
 # The client certificate selects the user. If the seat is on another node,
 # Moonlight is given that proxy's front address and then reset so it retries
 # there. Selkies is http on HTTP_PORT. Put Traefik in front of
-# Service/${PROXY_NAME} on the back network. /admin on that same port pairs
-# clients. The orchestrator itself is only on OVN_BACK_SUBNET.
+# Service/${PROXY_NAME} on the back network. / is the desktop login.
+# /pair is the same login and is where the Moonlight PIN is entered.
+# /admin is a read-only debug page. The orchestrator itself is only on
+# OVN_BACK_SUBNET.
 
 apiVersion: v1
 kind: Namespace
@@ -80,7 +82,7 @@ data:
   # CERT_PROXY=true (the default) ignores the base for routing. Every client
   # dials SUNSHINE_BASE, and the client certificate selects the login. The
   # base is only the listen span when CERT_PROXY=false. It must still not overlap.
-  # password is the Selkies login. Moonlight pairs at /admin, not with a pod.
+  # password is the Selkies login. Moonlight pairs at /pair, not with a pod.
   users.csv: |
     # username,password,base_port
     # Logins only. The unix account inside the seat is SEAT_USER in gs-config.
@@ -99,7 +101,7 @@ metadata:
 type: Opaque
 stringData:
   # Replace both before apply. cookie.secret is the HMAC key for gs_session
-  # and the orchestrator API. admin.password gates /admin. Neither is a
+  # and the orchestrator API. admin.password gates the /admin debug page. Neither is a
   # login from users.csv.
   cookie.secret: "CHANGE_ME_cookie_hmac_secret_at_least_32_random_bytes"
   admin.password: "CHANGE_ME_admin_ui_password"

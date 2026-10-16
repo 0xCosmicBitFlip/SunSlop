@@ -29,7 +29,11 @@ from gs.protocol import (
 )
 
 class PairServer:
-    """Sunshine's four pairing phases, with the PIN filled in from the admin UI."""
+    """Sunshine's four pairing phases. The PIN is typed on /pair by the
+    user who is already signed in. The pending client is the certificate
+    that is waiting, and the PIN is what proves this person can see that
+    client. A second user pairing at the same time has a different client
+    and a different PIN."""
 
     def __init__(self, store):
         self.store = store
@@ -174,6 +178,55 @@ class PairServer:
         self.store.update(commit)
         log(f"paired {rec['name']} as {rec['gsuser']}")
         return xml_response({"paired": 1})
+
+
+def claim_pin(store, uid, pin, gsuser):
+    """Bind this signed-in user to the client that is waiting on `uid`.
+
+    The form does not get to choose the user. A PIN already accepted for
+    a different user is left alone, so two people cannot take the same
+    client. Returns "" on success, otherwise a short reason.
+    """
+    pin = (pin or "").strip()
+    if not pin.isdigit() or len(pin) != 4:
+        return "pin"
+    if not uid or not gsuser:
+        return "missing"
+    result = {"err": "none"}
+
+    def save(data):
+        rec = (data.get("pending") or {}).get(uid)
+        if not rec or rec.get("phase") != "wait-pin":
+            return
+        owner = rec.get("gsuser") or ""
+        if rec.get("pin") and owner and owner != gsuser:
+            result["err"] = "taken"
+            return
+        rec["pin"] = pin
+        rec["gsuser"] = gsuser
+        result["err"] = ""
+
+    store.update(save)
+    return result["err"]
+
+
+def unpair_own(store, gsuser, fingerprint):
+    """Drop one certificate, and only if it is already this user's."""
+    if not gsuser or not fingerprint:
+        return False
+    removed = {"ok": False}
+
+    def save(data):
+        kept = []
+        for client in data.get("clients") or []:
+            if client.get("fingerprint") == fingerprint and client.get("gsuser") == gsuser:
+                removed["ok"] = True
+                continue
+            kept.append(client)
+        data["clients"] = kept
+
+    store.update(save)
+    return removed["ok"]
 
 
 def client_pair(host, pin, cert_pem, key_pem, http_port=SUNSHINE_HTTP, https_port=HTTPS_PORT):

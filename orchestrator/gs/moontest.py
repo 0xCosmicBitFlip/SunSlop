@@ -141,10 +141,41 @@ def self_test():
     assert safe_host("5.5.5.5:47984") == "5.5.5.5"
     assert safe_host("[2001:db8::1]:47984") == "[2001:db8::1]"
     assert safe_host("bad host") == ""
+    _pair_claim_test()
     _relay_test()
     _loopback()
     _flow_test()
     print("moonlight self-test ok")
+
+
+def _pair_claim_test():
+    pair_store = Store(os.path.join(tempfile.mkdtemp(), "pair.json"))
+
+    def add(data):
+        data["pending"]["aaaa"] = {
+            "uniqueid": "aaaa", "name": "living", "phase": "wait-pin",
+            "pin": "", "gsuser": "", "created": 1,
+        }
+        data["pending"]["bbbb"] = {
+            "uniqueid": "bbbb", "name": "kitchen", "phase": "wait-pin",
+            "pin": "", "gsuser": "", "created": 1,
+        }
+        data["clients"].append({"name": "old", "gsuser": "alice", "fingerprint": "aa", "cert": "x"})
+        data["clients"].append({"name": "other", "gsuser": "bob", "fingerprint": "bb", "cert": "y"})
+
+    pair_store.update(add)
+    assert claim_pin(pair_store, "aaaa", "1234", "alice") == ""
+    assert claim_pin(pair_store, "bbbb", "5678", "bob") == ""
+    snap = pair_store.snapshot()
+    assert snap["pending"]["aaaa"]["gsuser"] == "alice"
+    assert snap["pending"]["bbbb"]["pin"] == "5678"
+    assert claim_pin(pair_store, "bbbb", "0000", "alice") == "taken"
+    assert pair_store.snapshot()["pending"]["bbbb"]["gsuser"] == "bob"
+    assert unpair_own(pair_store, "alice", "bb") is False
+    assert unpair_own(pair_store, "alice", "aa") is True
+    left = {c["fingerprint"] for c in pair_store.snapshot()["clients"]}
+    assert left == {"bb"}
+    assert claim_pin(pair_store, "aaaa", "12", "alice") == "pin"
 
 
 def _relay_test():

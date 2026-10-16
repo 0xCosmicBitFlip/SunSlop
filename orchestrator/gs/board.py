@@ -208,6 +208,32 @@ class SeatBoard:
         self.cache.delete("own/" + user)
         self.cache.delete("act/" + user)
 
+    def view(self):
+        """Read-only snapshot for /admin. Does not claim or delete."""
+        now = time.time()
+        beats = []
+        for rec in self.cache.prefix("orch/").values():
+            value = rec["value"]
+            beat = value.get("beat")
+            beats.append({
+                "id": value.get("id") or "",
+                "ordinal": value.get("ordinal"),
+                "age": None if beat is None else int(now - beat),
+            })
+        owners = {}
+        for key, rec in self.cache.prefix("own/").items():
+            owners[key.split("/", 1)[-1]] = (rec["value"].get("owner") or "")
+        activity = {}
+        for key, rec in self.cache.prefix("act/").items():
+            activity[key.split("/", 1)[-1]] = rec["value"].get("activity")
+        return {
+            "id": self.me,
+            "ready": self.ready,
+            "heartbeats": beats,
+            "owners": owners,
+            "activity": activity,
+        }
+
 
 def self_test():
     from gs.cache import KeyStore

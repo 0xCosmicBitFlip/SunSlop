@@ -301,6 +301,41 @@ class Seats:
             return None
         return public_base(self.cfg, host)
 
+    def status(self):
+        """Pod list plus the board, for the debug page. No writes."""
+        now = time.time()
+        seats = []
+        for pod in self.kube.list_seats():
+            labels = (pod.get("metadata") or {}).get("labels") or {}
+            name = labels.get("gamestream.local/user") or ""
+            ann = activity_unix(pod)
+            seats.append({
+                "user": name,
+                "phase": pod_phase(pod),
+                "ready": bool(pod_ready(pod)),
+                "node": pod_node(pod) or "",
+                "ip": pod_ip(pod) or "",
+                "gpu": pod_gpu(pod),
+                "activity": ann,
+                "idle": None if ann is None else max(0, int(now - ann)),
+            })
+        board = {"id": getattr(self.cfg, "instance", ""), "ready": self.board is None}
+        if self.board is not None:
+            try:
+                board = self.board.view()
+            except Exception as exc:
+                board = {"id": self.board.me, "ready": False, "error": str(exc)[:200],
+                         "heartbeats": [], "owners": {}, "activity": {}}
+        owners = board.get("owners") or {}
+        acts = board.get("activity") or {}
+        for seat in seats:
+            seat["owner"] = owners.get(seat["user"]) or ""
+            cached = acts.get(seat["user"])
+            if cached is not None and (seat["activity"] is None or cached > seat["activity"]):
+                seat["activity"] = cached
+                seat["idle"] = max(0, int(now - cached))
+        return {"orchestrator": board, "seats": seats}
+
 
 
 def probe_failures(ready_timeout, period=2):
@@ -565,6 +600,13 @@ class RemoteSeats:
         except Exception:
             return None
         return data.get("url") or None
+
+    def status(self):
+        try:
+            data = self._call("POST", "/v1/status", {})
+        except Exception as exc:
+            return {"error": str(exc)[:200], "seats": [], "orchestrator": {}}
+        return data or {"seats": [], "orchestrator": {}}
 
     def _call(self, method, path, body, timeout=30):
         addrs = self._addrs()
