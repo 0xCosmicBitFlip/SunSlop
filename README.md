@@ -137,7 +137,7 @@ The Selkies cookie `gs_session` is HMAC-signed, HttpOnly, 30 days (`COOKIE_TTL`)
 
 ## Idle
 
-Default 600s (`IDLE_SECONDS`) with no proxied bytes. A `serverinfo` poll does not count, so an open Moonlight window does not pin a GPU. Launch, applist, Selkies, and the UDP stream do.
+Default 600s (`IDLE_SECONDS`) with no client traffic. An open Moonlight client keeps its seat: the HTTPS `serverinfo` poll counts, the same as launch, applist, Selkies, and the UDP stream. That poll does not create a seat. If the pod is already gone, the proxy answers `serverinfo` itself and the GPU stays free until launch or applist. Unpaired HTTP `serverinfo` does not count.
 
 The orchestrator is the only reaper. It deletes idle seats on every node. A proxy that is carrying the stream patches `gamestream.local/last-activity` (at most every 30 seconds). The seat stays while that annotation is fresh.
 

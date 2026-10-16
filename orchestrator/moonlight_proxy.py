@@ -1295,7 +1295,7 @@ class MoonlightProxy:
                     if kind == "remote":
                         if self._steer(ssock, user, placed, target, https=True):
                             return
-                        target_ip, count = placed.info, False
+                        target_ip = placed.info
                     elif kind != "local":
                         _c, _k, uid = self.store.server_material()
                         ssock.sendall(serverinfo_xml(
@@ -1304,7 +1304,10 @@ class MoonlightProxy:
                         ))
                         continue
                     else:
-                        target_ip, count = placed.info, False
+                        target_ip = placed.info
+                    # Moonlight polls this while the app is open. It does not
+                    # create a seat, but a seat that is already up stays up.
+                    count = True
                 else:
                     if user is None:
                         ssock.sendall(fail_xml("not paired" if client is None else f"no seat for {client['gsuser']}"))
@@ -2108,15 +2111,20 @@ def _flow_test():
     class Seats:
         def __init__(self):
             self.place = Place()
+            self.touches = []
+            self.ensured = []
 
         def lookup(self, user):
-            return self.place if user is not None else None
+            if user is None or self.place is None:
+                return None
+            return self.place
 
         def ensure(self, user):
+            self.ensured.append(user.name)
             return self.place
 
         def touch(self, name):
-            return None
+            self.touches.append(name)
 
     seats = Seats()
     proxy = MoonlightProxy(cfg, Directory(), seats)
@@ -2195,6 +2203,18 @@ def _flow_body(proxy, seats):
     assert b"<currentgame>7</currentgame>" in info
     uid = proxy.store.server_material()[2]
     assert f"<uniqueid>{uid}</uniqueid>".encode() in info
+    assert seats.touches == ["gsuser9"], seats.touches
+    assert seats.ensured == []
+    held = len(seats.touches)
+    saved = seats.place
+    seats.place = None
+    down, err = _tls_exchange(proxy.ports["https"], cert, key, "/serverinfo", "5.5.5.5")
+    assert err is None, err
+    assert b"<PairStatus>1</PairStatus>" in down
+    assert b"<currentgame>0</currentgame>" in down
+    assert seats.ensured == []
+    assert len(seats.touches) == held
+    seats.place = saved
     launch, err = _tls_exchange(proxy.ports["https"], cert, key, "/launch?appid=1", "5.5.5.5")
     assert err is None, err
     assert b"rtsp://5.5.5.5:48010" in launch
