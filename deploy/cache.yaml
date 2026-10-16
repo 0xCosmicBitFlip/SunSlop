@@ -1,0 +1,142 @@
+# Stock Redis on the back network. Not a SunSlop binary. Orchestrators
+# keep heartbeats, seat owners, and liveliness stamps here. Sentinel
+# answers with the primary. A replica refuses writes.
+#
+# CACHE_REPLICAS 1 is one pod (Sentinel quorum 1). 3 is a primary and two
+# replicas; if the primary dies, Sentinel promotes one and the keys remain.
+# There is no disk. If every pod restarts, the board is empty and the
+# orchestrators elect again from the seat pods.
+#
+# Apply with the other manifests:
+#   python3 deploy/render.py | kubectl apply -f -
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${CACHE_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  clusterIP: None
+  selector:
+    app: ${CACHE_NAME}
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+    - name: sentinel
+      port: 26379
+      targetPort: 26379
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: ${CACHE_NAME}
+  namespace: ${NAMESPACE}
+spec:
+  serviceName: ${CACHE_NAME}
+  replicas: ${CACHE_REPLICAS}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: ${CACHE_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${CACHE_NAME}
+      annotations:
+        ovn.kubernetes.io/logical_switch: ${OVN_BACK_SUBNET}
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: ${CACHE_NAME}
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: redis
+          image: ${REDIS_IMAGE}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: redis
+              containerPort: 6379
+            - name: sentinel
+              containerPort: 26379
+          env:
+            - name: CACHE_NAME
+              value: ${CACHE_NAME}
+            - name: CACHE_REPLICAS
+              value: "${CACHE_REPLICAS}"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              ord=${HOSTNAME##*-}
+              quorum=$(( CACHE_REPLICAS / 2 + 1 ))
+              # A peer Sentinel knows the primary after a failover. Asking
+              # ourselves fails while this pod is still starting. If nobody
+              # answers, pod 0 is the primary and the others follow it.
+              master=""
+              i=0
+              while [ "$i" -lt 5 ]; do
+                got=$(redis-cli -h "$CACHE_NAME" -p 26379 --raw SENTINEL get-master-addr-by-name sunslop 2>/dev/null | head -n 1 || true)
+                if [ -n "$got" ]; then
+                  master=$got
+                  break
+                fi
+                i=$(( i + 1 ))
+                sleep 0.2
+              done
+              cat > /tmp/redis.conf <<EOF
+              bind 0.0.0.0
+              port 6379
+              protected-mode no
+              save ""
+              appendonly no
+              replica-announce-ip $POD_IP
+              replica-announce-port 6379
+              EOF
+              if [ -n "$master" ] && [ "$master" != "$POD_IP" ]; then
+                printf 'replicaof %s 6379\n' "$master" >> /tmp/redis.conf
+              elif [ -z "$master" ] && [ "$ord" != "0" ]; then
+                printf 'replicaof %s-0.%s 6379\n' "$CACHE_NAME" "$CACHE_NAME" >> /tmp/redis.conf
+              fi
+              redis-server /tmp/redis.conf &
+              i=0
+              while [ "$i" -lt 50 ]; do
+                if redis-cli ping >/dev/null 2>&1; then
+                  break
+                fi
+                i=$(( i + 1 ))
+                sleep 0.1
+              done
+              redis-cli ping >/dev/null 2>&1
+              cat > /tmp/sentinel.conf <<EOF
+              bind 0.0.0.0
+              port 26379
+              protected-mode no
+              sentinel resolve-hostnames yes
+              sentinel announce-hostnames yes
+              sentinel announce-ip $POD_IP
+              sentinel announce-port 26379
+              sentinel monitor sunslop $CACHE_NAME-0.$CACHE_NAME 6379 $quorum
+              sentinel down-after-milliseconds sunslop 5000
+              sentinel failover-timeout sunslop 20000
+              sentinel parallel-syncs sunslop 1
+              EOF
+              exec redis-sentinel /tmp/sentinel.conf
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli ping && redis-cli -p 26379 ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli ping && redis-cli -p 26379 ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10

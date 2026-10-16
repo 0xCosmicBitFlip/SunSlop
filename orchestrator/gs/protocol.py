@@ -180,13 +180,15 @@ def parse_xml(text):
     return out
 
 
+def server_mac(uniqueid):
+    """Stable mac Moonlight stores next to uniqueid. Same inputs, same mac."""
+    digest = sha256((uniqueid or "").encode()).digest()
+    return "02:" + ":".join(f"{b:02x}" for b in digest[:5])
+
+
 def serverinfo_xml(paired, uniqueid, local_ip, https=False, http_port=SUNSHINE_HTTP,
                    https_port=HTTPS_PORT, external_ip=""):
-    if https:
-        digest = sha256(uniqueid.encode()).digest()
-        mac = "02:" + ":".join(f"{b:02x}" for b in digest[:5])
-    else:
-        mac = "00:00:00:00:00:00"
+    mac = server_mac(uniqueid) if https else "00:00:00:00:00:00"
     fields = {
         "hostname": "gs-proxy",
         "appversion": "7.1.431.-1",
@@ -371,10 +373,12 @@ def rewrite_backend_response(raw, host, uniqueid):
     """Sunshine answered from the pod. Put the client's host back.
 
     LocalIP is what Moonlight stores and polls next (Android tries it
-    first). sessionUrl0 is the RTSP url; current moonlight-common-c dials
-    the active address but uses this host in the RTSP request. uniqueid is
-    the computer id. The seat has its own, and a later poll must not look
-    like a different PC from the serverinfo this proxy already sent.
+    first). ExternalIP is the address it keeps as the remote one, so a
+    pod address there would be dialed later. sessionUrl0 is the RTSP url;
+    current moonlight-common-c dials the active address but uses this host
+    in the RTSP request. uniqueid is the computer id Android requires.
+    The mac is stored beside it; the seat's own mac would replace the one
+    this proxy already advertised.
     """
     host = safe_host(host)
     if not raw or not host or b"\r\n\r\n" not in raw:
@@ -388,10 +392,21 @@ def rewrite_backend_response(raw, host, uniqueid):
         lambda m: m.group(1) + host + m.group(2),
         text,
     )
+    text = re.sub(
+        r"(<ExternalIP>)[^<]*(</ExternalIP>)",
+        lambda m: m.group(1) + host + m.group(2),
+        text,
+    )
     if uniqueid and re.fullmatch(r"[A-Za-z0-9-]+", uniqueid):
         text = re.sub(
             r"(<uniqueid>)[^<]*(</uniqueid>)",
             lambda m: m.group(1) + uniqueid + m.group(2),
+            text,
+        )
+        mac = server_mac(uniqueid)
+        text = re.sub(
+            r"(<mac>)[^<]*(</mac>)",
+            lambda m: m.group(1) + mac + m.group(2),
             text,
         )
     text = _SESSION_URL.sub(lambda m: m.group(1) + host + m.group(3), text)

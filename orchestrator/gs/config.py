@@ -79,6 +79,10 @@ class Config:
     ovn_back_subnet: str = "ovn-default"
     ovn_front_network: str = "cs1-resident"
     ovn_front_nad_ns: str = "default"
+    cache_url: str = ""
+    orch_stale: int = 15
+    claim_grace: int = 45
+    instance: str = ""
 
 
 def env_get(name, default):
@@ -196,6 +200,12 @@ def load_config():
     orch_url = env_get("ORCH_URL", "")
     if role == "proxy" and not orch_url:
         orch_url = f"http://{env_get('ORCH_NAME', 'gs-orchestrator')}:{http_port}"
+    cache_name = _safe(env_get("CACHE_NAME", "gs-redis"), "CACHE_NAME")
+    cache_url = os.environ.get("CACHE_URL") or f"redis+sentinel://{cache_name}:26379/sunslop"
+    instance = _safe(
+        os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "gs-orchestrator-0",
+        "POD_NAME",
+    )
     return Config(
         node=os.environ["NODE_NAME"],
         namespace=os.environ.get("POD_NAMESPACE", ""),
@@ -272,6 +282,10 @@ def load_config():
         ovn_back_subnet=_safe(env_get("OVN_BACK_SUBNET", "ovn-default"), "OVN_BACK_SUBNET"),
         ovn_front_network=_safe(env_get("OVN_FRONT_NETWORK", "cs1-resident"), "OVN_FRONT_NETWORK"),
         ovn_front_nad_ns=_safe(env_get("OVN_FRONT_NAD_NS", "default"), "OVN_FRONT_NAD_NS"),
+        cache_url=cache_url,
+        orch_stale=env_int("ORCH_STALE_SECONDS", 15),
+        claim_grace=env_int("CLAIM_GRACE", 45),
+        instance=instance,
     )
 
 

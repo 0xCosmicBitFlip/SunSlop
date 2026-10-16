@@ -1,8 +1,10 @@
 """Create, find, and delete seat pods."""
 import json
+import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from gs.kube import activity_unix, pod_gpu, pod_ip, pod_node, pod_phase, pod_ready
@@ -31,6 +33,7 @@ class Seats:
         self.activity = {}
         self._patched = {}
         self.starting = set()
+        self.board = None
 
     def _lock(self, name):
         with self._guard:
@@ -52,6 +55,11 @@ class Seats:
         user = self.directory.get(name)
         if user is None:
             return
+        if self.board is not None:
+            try:
+                self.board.stamp(name)
+            except Exception as exc:
+                log(f"{name}: activity stamp {exc}")
         try:
             code, data = self.kube.patch_pod(
                 user.pod_name,
@@ -89,6 +97,19 @@ class Seats:
         with self._lock(user.name):
             self.starting.add(user.name)
             try:
+                if self.board is not None and not self.board.ready:
+                    pod = self.kube.get_pod(user.pod_name)
+                    # An already-running seat keeps its stream. Do not wait
+                    # out ready_timeout, and do not create, until this
+                    # process has finished the election.
+                    if (
+                        pod
+                        and pod_phase(pod) == "Running"
+                        and pod_ready(pod)
+                        and pod_ip(pod)
+                    ):
+                        return self._from_pod(user, pod, prefer)
+                    return Place("inventory", "no seat inventory yet")
                 return self._ensure(user, prefer)
             finally:
                 self.starting.discard(user.name)
@@ -135,6 +156,11 @@ class Seats:
             msg = (data or {}).get("message", data)
             log(f"{user.name}: create {code} {msg}")
             return Place("error", str(msg)[:300])
+        if self.board is not None:
+            try:
+                self.board.own(user.name, node)
+            except Exception as exc:
+                log(f"{user.name}: owner {exc}")
         log(f"{user.name}: creating on {node} gpu {gpu} "
             f"sunshine {self.cfg.sunshine_base + PORT_LO}-{self.cfg.sunshine_base + PORT_HI}")
         if node != prefer:
@@ -211,7 +237,27 @@ class Seats:
         log(f"{user.name}: not Ready after {self.cfg.ready_timeout}s")
         return None
 
+    def reconcile(self):
+        if self.board is None:
+            return
+        pods = []
+        for pod in self.kube.list_seats():
+            if pod_phase(pod) not in ("Pending", "Running"):
+                continue
+            labels = pod.get("metadata", {}).get("labels") or {}
+            name = labels.get("gamestream.local/user")
+            if not name:
+                continue
+            pods.append({
+                "user": name,
+                "node": pod_node(pod) or "",
+                "ann": activity_unix(pod),
+            })
+        self.board.reconcile(pods)
+
     def reap(self):
+        if self.board is not None and not self.board.ready:
+            return
         now = time.monotonic()
         now_w = time.time()
         for pod in self.kube.list_seats():
@@ -221,20 +267,33 @@ class Seats:
             name = labels.get("gamestream.local/user")
             if not name or name in self.starting:
                 continue
-            ann = activity_unix(pod)
-            remote_idle = None if ann is None else now_w - ann
-            last = self.activity.get(name)
-            if last is None and remote_idle is None:
-                self.activity[name] = now
-                continue
-            local_idle = None if last is None else now - last
-            if still_active(local_idle, remote_idle, self.cfg.idle_seconds):
-                continue
+            if self.board is not None:
+                try:
+                    if not self.board.reapable(name, activity_unix(pod), now_w):
+                        continue
+                except Exception as exc:
+                    log(f"reap: {exc}")
+                    return
+            else:
+                ann = activity_unix(pod)
+                remote_idle = None if ann is None else now_w - ann
+                last = self.activity.get(name)
+                if last is None and remote_idle is None:
+                    self.activity[name] = now
+                    continue
+                local_idle = None if last is None else now - last
+                if still_active(local_idle, remote_idle, self.cfg.idle_seconds):
+                    continue
             log(f"{name}: idle, deleting pod")
             code, data = self.kube.delete_pod(pod["metadata"]["name"])
             if code not in (200, 202, 404):
                 log(f"{name}: delete {code} {data}")
             self.activity.pop(name, None)
+            if self.board is not None:
+                try:
+                    self.board.drop(name)
+                except Exception as exc:
+                    log(f"{name}: drop {exc}")
 
     def owner_url(self, node):
         host = self._host_for(node)
@@ -438,6 +497,10 @@ def seat_pod(cfg, user, gpu, node=None):
     }
 
 
+class Inventory(Exception):
+    pass
+
+
 class RemoteSeats:
     """Proxy-side view. The orchestrator owns create, delete, and placement."""
 
@@ -445,6 +508,7 @@ class RemoteSeats:
         self.cfg = cfg
         self._patched = {}
         self._guard = threading.Lock()
+        self._rr = 0
 
     def touch(self, name):
         now = time.monotonic()
@@ -459,6 +523,8 @@ class RemoteSeats:
             self._call("POST", "/v1/touch", {"user": name})
         except Exception as exc:
             log(f"{name}: touch {exc}")
+            with self._guard:
+                self._patched.pop(name, None)
 
     def lookup(self, user):
         if user is None:
@@ -473,12 +539,24 @@ class RemoteSeats:
         return place_from_api(data)
 
     def ensure(self, user):
-        data = self._call(
-            "POST",
-            "/v1/ensure",
-            {"user": user.name, "preferNode": self.cfg.node},
-            timeout=self.cfg.ready_timeout + 60,
-        )
+        try:
+            data = self._call(
+                "POST",
+                "/v1/ensure",
+                {"user": user.name, "preferNode": self.cfg.node},
+                timeout=self.cfg.ready_timeout + 60,
+            )
+        except Inventory:
+            found = self.lookup(user)
+            if found is not None:
+                return found
+            return Place("inventory", "no seat inventory yet")
+        except (OSError, urllib.error.URLError) as exc:
+            found = self.lookup(user)
+            if found is not None:
+                return found
+            log(f"{user.name}: ensure {exc}")
+            return Place("inventory", "orchestrator unavailable")
         return place_from_api(data)
 
     def owner_url(self, node):
@@ -489,15 +567,50 @@ class RemoteSeats:
         return data.get("url") or None
 
     def _call(self, method, path, body, timeout=30):
-        url = self.cfg.orch_url.rstrip("/") + path
-        req = urllib.request.Request(url, data=json.dumps(body).encode(), method=method)
-        req.add_header("Authorization", "Bearer " + api_token(self.cfg.secret))
-        req.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as exc:
-            raw = exc.read()
-            raise RuntimeError(f"{exc.code} {raw[:200]!r}") from exc
+        addrs = self._addrs()
+        payload = json.dumps(body).encode()
+        token = "Bearer " + api_token(self.cfg.secret)
+        inventory = False
+        last = None
+        for addr in addrs:
+            host = f"[{addr}]" if ":" in addr else addr
+            url = f"{self._scheme}://{host}:{self._port}{path}"
+            req = urllib.request.Request(url, data=payload, method=method)
+            req.add_header("Authorization", token)
+            req.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read()
+                    return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as exc:
+                raw = exc.read()
+                if exc.code == 503:
+                    inventory = True
+                    continue
+                raise RuntimeError(f"{exc.code} {raw[:200]!r}") from exc
+            except (OSError, urllib.error.URLError) as exc:
+                last = exc
+                continue
+        if inventory:
+            raise Inventory()
+        raise RuntimeError(f"no orchestrator ({last})")
+
+    def _addrs(self):
+        parts = urllib.parse.urlsplit(self.cfg.orch_url)
+        host = parts.hostname
+        if not host:
+            raise RuntimeError("no orchestrator address")
+        self._scheme = parts.scheme or "http"
+        self._port = parts.port or (443 if self._scheme == "https" else 80)
+        infos = socket.getaddrinfo(host, self._port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        seen = []
+        for info in infos:
+            ip = info[4][0]
+            if ip not in seen:
+                seen.append(ip)
+        if not seen:
+            raise RuntimeError("no orchestrator address")
+        start = self._rr % len(seen)
+        self._rr += 1
+        return seen[start:] + seen[:start]
 

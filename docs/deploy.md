@@ -199,12 +199,15 @@ The proxy compiles `gs-relay` the first time it starts. The startup probe allows
 ```bash
 python3 deploy/render.py | kubectl apply -f -
 NS=gamestream   # NAMESPACE
-kubectl -n "$NS" rollout status deploy/gs-orchestrator
+kubectl -n "$NS" rollout status sts/gs-orchestrator
+kubectl -n "$NS" rollout status sts/gs-redis
 kubectl -n "$NS" rollout status ds/gs-proxy
 kubectl -n "$NS" logs deploy/gs-orchestrator | head
 ```
 
 The orchestrator log line `persist: ...` is the mount it actually got. If a proxy stays Pending, the node is missing one of the two labels from step 7, or `cs1-resident` is not a NetworkAttachmentDefinition in `OVN_FRONT_NAD_NS`. A seat that starts on a different subnet than the proxy cannot be reached: both must be on `OVN_BACK_SUBNET`. If kube-ovn has already bound this namespace to some other subnet, add `${NAMESPACE}` to the back subnet's `spec.namespaces` and take it off the other one.
+
+`ORCH_REPLICAS` defaults to 1. Set it to 2 or 3 for a spare. The pods are `gs-orchestrator-0` and up, and the Service is headless so a proxy can reach any of them. Every orchestrator node has to mount `PERSIST_ROOT`. The board is Redis, image `REDIS_IMAGE` (`redis:7.4-alpine`), not a container built from this repo. `CACHE_REPLICAS` 1 is one pod. 3 is a primary and two replicas; Sentinel promotes a replica if the primary dies, and the keys stay. Redis does not use a disk. If every Redis pod restarts while the orchestrators are still up, the next pass lists the seat pods and waits one `ORCH_STALE_SECONDS` (15s) so every live orchestrator has checked in. The lowest ordinal then adopts the seats that no longer have an owner. A proxy keeps posting liveliness, so a seat that is still in use gets a new stamp and stays. A seat whose last stamp is already older than `IDLE_SECONDS` is deleted by that new owner. Proxies refuse a new session until the election is done. A session that already has a pod keeps working.
 
 This apply replaces the RuntimeClass from step 6 and adds the node selector. That is what you want once the nodes are labeled.
 

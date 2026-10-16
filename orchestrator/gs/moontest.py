@@ -121,14 +121,18 @@ def self_test():
     sample = http_response(
         b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
         b"<root status_code=\"200\"><uniqueid>SEAT</uniqueid>"
-        b"<LocalIP>10.9.9.9</LocalIP><currentgame>7</currentgame>"
+        b"<mac>00:11:22:33:44:55</mac>"
+        b"<LocalIP>10.9.9.9</LocalIP><ExternalIP>10.9.9.9</ExternalIP>"
+        b"<currentgame>7</currentgame>"
         b"<sessionUrl0>rtsp://10.9.9.9:48010</sessionUrl0>"
         b"<sessionUrl1>rtspenc://10.9.9.9:48010</sessionUrl1></root>",
         b"application/xml",
     )
     rewritten = rewrite_backend_response(sample, "5.5.5.5:47984", "proxyuid")
     assert b"<LocalIP>5.5.5.5</LocalIP>" in rewritten
+    assert b"<ExternalIP>5.5.5.5</ExternalIP>" in rewritten
     assert b"<uniqueid>proxyuid</uniqueid>" in rewritten
+    assert f"<mac>{server_mac('proxyuid')}</mac>".encode() in rewritten
     assert b"rtsp://5.5.5.5:48010" in rewritten
     assert b"rtspenc://5.5.5.5:48010" in rewritten
     assert b"<currentgame>7</currentgame>" in rewritten

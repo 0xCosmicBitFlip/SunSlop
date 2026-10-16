@@ -47,6 +47,12 @@ def main():
     cfg.namespace = kube.ns
     seats = Seats(cfg, directory, kube)
     if cfg.role == "orchestrator":
+        from gs.board import SeatBoard
+        from gs.cache import CacheClient
+        seats.board = SeatBoard(
+            cfg.instance, CacheClient(cfg.cache_url),
+            stale=cfg.orch_stale, grace=cfg.claim_grace, idle=cfg.idle_seconds,
+        )
         OrchestratorApi(cfg, directory, seats).serve()
         return 0
     App(cfg, directory, seats).serve()

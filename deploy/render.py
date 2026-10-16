@@ -118,6 +118,13 @@ def main(argv):
         assert "k8s.v1.cni.cncf.io/networks: default/cs1-resident" in proxy
         assert "ovn.kubernetes.io/logical_switch: ovn-default" in proxy
         assert "cs1-resident.default.ovn.kubernetes.io/logical_switch: cs1-resident" in proxy
+        orch = fill((HERE / "orchestrator.yaml").read_text(), values, HERE / "orchestrator.yaml")
+        assert "kind: StatefulSet" in orch
+        assert "clusterIP: None" in orch
+        cache = fill((HERE / "cache.yaml").read_text(), values, HERE / "cache.yaml")
+        assert "clusterIP: None" in cache
+        assert "redis:7.4-alpine" in cache
+        assert "redis-sentinel" in cache
         seat = fill((HERE / "seat-direct.yaml").read_text(), values, HERE / "seat-direct.yaml")
         assert "ovn.kubernetes.io/logical_switch: ovn-default" in seat
         assert "cs1-resident" not in seat
@@ -127,7 +134,7 @@ def main(argv):
         print("render self-test ok")
         return 0
     values = derive(load_config(HERE / "gs-config.yaml"))
-    names = ["gs-config.yaml", "orchestrator.yaml", "proxy.yaml"]
+    names = ["gs-config.yaml", "orchestrator.yaml", "cache.yaml", "proxy.yaml"]
     if "--time-slicing" in argv:
         names.append("time-slicing.yaml")
     if "--seat" in argv:

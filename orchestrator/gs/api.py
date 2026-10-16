@@ -18,6 +18,8 @@ class OrchestratorApi:
         publish_proxy_cert(self.cfg)
         threading.Thread(target=self._reap, name="reap", daemon=True).start()
         threading.Thread(target=self._reload, name="reload", daemon=True).start()
+        if self.seats.board is not None:
+            threading.Thread(target=self._board, name="board", daemon=True).start()
         log(f"orchestrator api on :{self.cfg.http_port}, idle {self.cfg.idle_seconds}s")
         self._http()
 
@@ -28,6 +30,14 @@ class OrchestratorApi:
                 self.seats.reap()
             except Exception as exc:
                 log(f"reap: {exc}")
+
+    def _board(self):
+        while True:
+            try:
+                self.seats.reconcile()
+            except Exception as exc:
+                log(f"inventory: {exc}")
+            time.sleep(5)
 
     def _reload(self):
         while True:
@@ -105,7 +115,11 @@ class OrchestratorApi:
                 if user is None:
                     return
                 prefer = body.get("preferNode") or api.cfg.node
-                self._json(200, place_dict(api.seats.ensure(user, prefer_node=prefer)))
+                placed = api.seats.ensure(user, prefer_node=prefer)
+                if placed.kind == "inventory":
+                    self._json(503, place_dict(placed))
+                    return
+                self._json(200, place_dict(placed))
 
             def _lookup(self, body):
                 user = self._user(body)

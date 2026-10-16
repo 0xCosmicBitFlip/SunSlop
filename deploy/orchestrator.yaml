@@ -1,10 +1,9 @@
-# One orchestrator, anywhere. Same image as the proxy DaemonSet. GS_ROLE
-# selects this process (orchestrator.py). It creates seats. It does not
-# listen for Moonlight. The public listeners are the ${PROXY_NAME} DaemonSet
-# in proxy.yaml.
-#
-# Site values come from deploy/gs-config.yaml. Apply with:
-#   python3 deploy/render.py | kubectl apply -f -
+# One or more orchestrators. Same image as the proxy. Redis is separate.
+# GS_ROLE selects orchestrator.py. It creates seats. It does not listen
+# for Moonlight. The Service is headless: its DNS record is one address
+# per pod, and a proxy tries those addresses. The pod that accepts a new
+# seat owns it. Only that owner deletes it, and only when the liveliness
+# stamp in the cache is stale.
 #
 # Moonlight dials the Sunshine ports on a proxy's cs1-resident address.
 # The client certificate selects the user. If the seat is on another node,
@@ -111,6 +110,7 @@ metadata:
   name: ${ORCH_NAME}
   namespace: ${NAMESPACE}
 spec:
+  clusterIP: None
   selector:
     app: ${ORCH_NAME}
   ports:
@@ -119,12 +119,14 @@ spec:
       targetPort: ${HTTP_PORT}
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: ${ORCH_NAME}
   namespace: ${NAMESPACE}
 spec:
+  serviceName: ${ORCH_NAME}
   replicas: ${ORCH_REPLICAS}
+  podManagementPolicy: Parallel
   selector:
     matchLabels:
       app: ${ORCH_NAME}
@@ -136,6 +138,15 @@ spec:
         ovn.kubernetes.io/logical_switch: ${OVN_BACK_SUBNET}
     spec:
       serviceAccountName: ${ORCH_NAME}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: ${ORCH_NAME}
+                topologyKey: kubernetes.io/hostname
       containers:
         - name: orchestrator
           image: ${ORCH_IMAGE}
@@ -149,6 +160,10 @@ spec:
           env:
             - name: GS_ROLE
               value: orchestrator
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
             - name: NODE_NAME
               valueFrom:
                 fieldRef:

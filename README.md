@@ -12,14 +12,14 @@ Kubernetes object names stay `gs-orchestrator`, `gs-proxy`, and `gamestream` unl
 
 - Kubernetes workers that have already passed [docs/nvkvm-kata.md](docs/nvkvm-kata.md). Do not apply a seat until that gate prints `GATE_OK` and the node is labeled `nvkvm.kata/ready=true`. The proxy DaemonSet requires that label as well as `nvidia.com/gpu.present=true`. Seats are pinned with `nodeName`, which does not re-check the RuntimeClass selector, so an unlabeled node must not be running a proxy.
 - A filesystem mounted at the same `PERSIST_ROOT` on every proxy node and on the orchestrator node.
-- The seat image imported on every GPU node, and one control-plane image (`ORCH_IMAGE`) on the orchestrator node and every proxy node. The orchestrator Deployment and the proxy DaemonSet use that same image. `GS_ROLE` on the pod is what the entrypoint runs: `orchestrator` starts `orchestrator.py`, `proxy` compiles `gs-relay` and starts `moonlight_proxy.py`.
+- The seat image imported on every GPU node, and one control-plane image (`ORCH_IMAGE`) on every orchestrator node and every proxy node. Redis is a separate image (`REDIS_IMAGE`, `redis:7.4-alpine`). The orchestrator and the proxy use the control-plane image. `GS_ROLE` on the pod is what the entrypoint runs: `orchestrator` starts `orchestrator.py`, `proxy` compiles `gs-relay` and starts `moonlight_proxy.py`.
 - Traefik, or anything else that can route HTTP to Service `gs-proxy` on the back network. Moonlight does not go through that HTTP route. It dials the Sunshine ports on the proxy's `cs1-resident` address.
 
 ## What listens where
 
 Proxies are a DaemonSet, one per GPU node, with two kube-ovn interfaces. The primary NIC is `OVN_BACK_SUBNET` (the subnet the `default` namespace uses, `ovn-default` unless that namespace was moved). The orchestrator and every seat use only that network, and that is how the proxy reaches Service `gs-orchestrator` and the seat pod IPs. The second NIC is the attachment `OVN_FRONT_NAD_NS/OVN_FRONT_NETWORK` (`default/cs1-resident`). Moonlight dials the address kube-ovn assigns there. The default route stays on the back NIC. There is no `hostNetwork` and no `hostPort`.
 
-The proxy selects `nvidia.com/gpu.present=true` and `nvkvm.kata/ready=true`, and does not request `nvidia.com/gpu`, so it does not consume a seat. The orchestrator is one Deployment with no GPU. It is the only kube API client. Each seat runs Sunshine on `SUNSHINE_BASE` (47989) and Selkies on `SELKIES_PORT` (8082). Clients never pair with a pod.
+The proxy selects `nvidia.com/gpu.present=true` and `nvkvm.kata/ready=true`, and does not request `nvidia.com/gpu`, so it does not consume a seat. Orchestrators are a StatefulSet on the back network, one pod or several (`ORCH_REPLICAS`). They are the only kube API clients. Seat owners and liveliness live in Redis (`gs-redis`) on that same network. Each seat runs Sunshine on `SUNSHINE_BASE` (47989) and Selkies on `SELKIES_PORT` (8082). Clients never pair with a pod.
 
 | Client | Where it connects | What happens |
 |---|---|---|
@@ -106,7 +106,7 @@ docker build -f orchestrator/Dockerfile -t gs-orchestrator:local .
 docker save gamestream:local gs-orchestrator:local | sudo ctr -n k8s.io images import -
 ```
 
-Import the seat image on every GPU node. Import `ORCH_IMAGE` (`gs-orchestrator:local` unless you changed it) on the orchestrator's node and on every proxy node. It is one image. It needs `python3-cryptography`, plus `rust`, `cargo`, and `gcc`. The container entrypoint reads `GS_ROLE`. `orchestrator` skips the relay and runs `orchestrator.py`. `proxy` compiles `gs-relay` from `/usr/local/src/gs-relay`, installs `/usr/local/bin/gs-relay`, and runs `moonlight_proxy.py`. The first proxy start is a release build; the proxy `startupProbe` allows five minutes. A later start of the same container filesystem skips the compile when the source stamp matches. `CERT_PROXY=false` does not use the relay. That mode still forwards the whole port span in Python.
+Import the seat image on every GPU node. Import `ORCH_IMAGE` (`gs-orchestrator:local` unless you changed it) on every node that runs an orchestrator or a proxy. It is one image. It needs `python3-cryptography`, plus `rust`, `cargo`, and `gcc`. The container entrypoint reads `GS_ROLE`. `orchestrator` skips the relay and runs `orchestrator.py`. `proxy` compiles `gs-relay` from `/usr/local/src/gs-relay`, installs `/usr/local/bin/gs-relay`, and runs `moonlight_proxy.py`. The first proxy start is a release build; the proxy `startupProbe` allows five minutes. A later start of the same container filesystem skips the compile when the source stamp matches. `CERT_PROXY=false` does not use the relay. That mode still forwards the whole port span in Python. Redis is `REDIS_IMAGE` (`redis:7.4-alpine`). The cluster pulls that itself. It is not built from this repo.
 
 ## Apply
 
@@ -114,7 +114,8 @@ Follow [docs/deploy.md](docs/deploy.md). The short form, after the gate, the lab
 
 ```bash
 python3 deploy/render.py | kubectl apply -f -
-kubectl -n "$NS" rollout status deploy/gs-orchestrator
+kubectl -n "$NS" rollout status sts/gs-orchestrator
+kubectl -n "$NS" rollout status sts/gs-redis
 kubectl -n "$NS" rollout status ds/gs-proxy
 ```
 
@@ -147,7 +148,9 @@ The Selkies cookie `gs_session` is HMAC-signed, HttpOnly, 30 days (`COOKIE_TTL`)
 
 Default 600s (`IDLE_SECONDS`) with no client traffic. An open Moonlight client keeps its seat: the HTTPS `serverinfo` poll counts, the same as launch, applist, Selkies, and the UDP stream. That poll does not create a seat. If the pod is already gone, the proxy answers `serverinfo` itself and the GPU stays free until launch or applist. Unpaired HTTP `serverinfo` does not count.
 
-The orchestrator is the only reaper. It deletes idle seats on every node. A proxy that is carrying the stream patches `gamestream.local/last-activity` (at most every 30 seconds). The seat stays while that annotation is fresh.
+The orchestrators are the only reapers, and only the owner of a seat deletes it. Ownership and the liveliness stamp are keys in Redis, not memory in one process. A proxy posts the stamp to the orchestrator Service, which is a DNS record with one address per pod, so whichever orchestrator answers can update the stamp. It does not change the owner. The owner is the orchestrator that created the seat. Heartbeats are the same Redis. If `gs-orchestrator-0` stops beating, the next lowest ordinal (`gs-orchestrator-1`, then `gs-orchestrator-2`) adopts the seats it left. A live owner is not replaced just because a lower ordinal comes back.
+
+Redis is the `redis:7.4-alpine` image, with Sentinel in the same pod. `CACHE_REPLICAS` 1 is one pod. 3 is a primary and two replicas: if the primary dies, Sentinel promotes a replica and the keys stay, so nothing is re-elected. Nothing is written to disk. If every Redis pod restarts, the board is empty. The orchestrators are still running, so the next pass lists the seat pods, writes heartbeats, and waits until that set of live orchestrators has sat still for `ORCH_STALE_SECONDS` (15s). Then the lowest ordinal adopts the ownerless seats. It does not invent a new activity time: the stamp is the pod annotation, unless a proxy has already posted a newer one. A seat that was already idle is deleted on the next reap. A seat that is still in use stays. Until that election finishes, a proxy rejects a new session and keeps one that already has a pod.
 
 That is not a pause. Kata has no API that snapshots a VM, drops GPU memory and RAM, and restores the same processes. Checkpointing through the kubelet would also need `nodes/proxy`, which this ServiceAccount does not have. Delete frees the GPU and the memory. The game process is gone. Files under the home mount, Sunshine's pairing state, the shared package layer, the TPU scratchpad, and the UEFI variable store are not.
 
@@ -246,7 +249,8 @@ cargo test --offline --manifest-path orchestrator/gs-relay/Cargo.toml
 | [orchestrator/gs-relay](orchestrator/gs-relay) | UDP and RTSP data plane, compiled on the proxy at start |
 | [deploy/gs-config.yaml](deploy/gs-config.yaml) | site paths, account, ports, images |
 | [deploy/render.py](deploy/render.py) | copies the ConfigMap into the other manifests |
-| [deploy/orchestrator.yaml](deploy/orchestrator.yaml) | Deployment, RBAC, users, cookie Secret |
+| [deploy/orchestrator.yaml](deploy/orchestrator.yaml) | StatefulSet, headless Service, RBAC, users, cookie Secret |
+| [deploy/cache.yaml](deploy/cache.yaml) | Redis and Sentinel, headless Service, back network |
 | [deploy/proxy.yaml](deploy/proxy.yaml) | DaemonSet. Back NIC `ovn-default`, front NIC `cs1-resident`. No GPU request |
 | [image/](image) | seat image: labwc, Sunshine, Selkies, package layer, seat-boot |
 | [image/layer-init.sh](image/layer-init.sh) | init container: the only writer of the shared layer |

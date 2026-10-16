@@ -112,7 +112,22 @@ data:
   ORCH_NAME: "gs-orchestrator"
   PROXY_NAME: "gs-proxy"
   SEAT_APP: "gamestream"
+  # 1 is one orchestrator. 2 or 3 is n+1. gs-orchestrator-0 is the lowest
+  # ordinal and adopts a seat only when its owner's heartbeat is stale.
+  # Every replica needs PERSIST_ROOT mounted. They find each other through
+  # the headless Service DNS records, and they keep that state in Redis.
   ORCH_REPLICAS: "1"
+  CACHE_NAME: "gs-redis"
+  # Stock Redis image. 1 is one pod. 3 is a primary plus two replicas;
+  # Sentinel (quorum is half plus one) promotes a replica if the primary
+  # dies. The board is memory only. If every Redis pod restarts, it is empty.
+  CACHE_REPLICAS: "1"
+  REDIS_IMAGE: "redis:7.4-alpine"
+  # An orchestrator heartbeat older than this is dead. A seat with no
+  # activity stamp is kept this long after it is claimed, so a live proxy
+  # can check in. Both are seconds.
+  ORCH_STALE_SECONDS: "15"
+  CLAIM_GRACE: "45"
   # users.csv example rows. Only matters when CERT_PROXY=false.
   USER_PORT_STRIDE: "100"
 

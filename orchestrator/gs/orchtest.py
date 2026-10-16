@@ -29,6 +29,10 @@ def _bind():
 _bind()
 
 def self_test():
+    from gs.board import self_test as board_test
+    from gs.cache import self_test as cache_test
+    cache_test()
+    board_test()
     users = load_users(
         "# c\ngsuser0,secret,47989\ngsuser1,other,48089\n"
     )
