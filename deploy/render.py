@@ -78,6 +78,10 @@ def derive(values):
     values.setdefault("SUNSHINE_UDP_PORTS", ",".join(str(base + off) for off in offs))
     for i in range(8):
         values.setdefault(f"USER_BASE_{i}", str(base + i * stride))
+    ready = _num(values, "READY_TIMEOUT") if "READY_TIMEOUT" in values else 900
+    period = 2
+    ready = max(ready, period)
+    values.setdefault("SEAT_PROBE_FAILURES", str(max(1, (ready + period - 1) // period)))
     return values
 
 
@@ -92,7 +96,27 @@ def fill(text, values, path):
     return PLACE.sub(repl, text)
 
 
+def placeholder_lines(text):
+    """Secrets and passwords that were never replaced. Comments do not count."""
+    found = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if "CHANGE_ME" in line:
+            found.append(stripped[:160])
+    return found
+
+
 def main(argv):
+    if "--self-test" in argv:
+        values = derive(load_config(HERE / "gs-config.yaml"))
+        assert values["SEAT_PROBE_FAILURES"] == "450", values["SEAT_PROBE_FAILURES"]
+        sample = (HERE / "orchestrator.yaml").read_text()
+        assert placeholder_lines(sample), "sample manifest has no CHANGE_ME secrets"
+        assert not placeholder_lines("# CHANGE_ME in a comment\nkey: value\n")
+        print("render self-test ok")
+        return 0
     values = derive(load_config(HERE / "gs-config.yaml"))
     names = ["gs-config.yaml", "orchestrator.yaml", "proxy.yaml"]
     if "--time-slicing" in argv:
@@ -103,7 +127,19 @@ def main(argv):
     for name in names:
         path = HERE / name
         parts.append(fill(path.read_text(), values, path).strip())
-    sys.stdout.write("\n---\n".join(parts) + "\n")
+    rendered = "\n---\n".join(parts) + "\n"
+    if "--allow-placeholders" not in argv:
+        found = placeholder_lines(rendered)
+        if found:
+            preview = "\n".join(found[:8])
+            raise SystemExit(
+                "refusing to render: replace CHANGE_ME secrets and Selkies passwords "
+                "before apply. /admin and the cookie key would otherwise ship as the "
+                "sample values.\n"
+                + preview
+                + "\nInspect only with: python3 deploy/render.py --allow-placeholders"
+            )
+    sys.stdout.write(rendered)
     return 0
 
 

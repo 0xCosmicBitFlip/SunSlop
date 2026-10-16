@@ -22,8 +22,9 @@ data:
   RUNTIME_CLASS: "nvkvm-kata"
 
   # Host disk, the same shared filesystem on every proxy node and on the
-  # node that runs the orchestrator. A node-local empty directory mints a
-  # second certificate. Homes are PERSIST_ROOT/<login>.
+  # node that runs the orchestrator. Create <PERSIST_ROOT>/.sunslop-volume
+  # on that filesystem before apply. A node-local empty directory is refused
+  # at startup, because it would mint a second certificate.
   PERSIST_ROOT: "/var/lib/gamestream/persistent"
   # Where the orchestrator pod mounts PERSIST_ROOT. This is not a host path.
   PERSIST_MOUNT: "/var/lib/gs-persist"

@@ -98,7 +98,7 @@ spec:
           command: ["/bin/bash", "-lc", "test -S ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"]
         initialDelaySeconds: 3
         periodSeconds: 2
-        failureThreshold: 450
+        failureThreshold: ${SEAT_PROBE_FAILURES}
       resources:
         requests:
           cpu: "${SEAT_CPU_REQUEST}"

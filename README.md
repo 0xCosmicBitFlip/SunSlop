@@ -4,18 +4,20 @@ On-demand [Sunshine](https://github.com/LizardByte/Sunshine) and [Selkies](https
 
 Moonlight pairs with the proxy, not with a pod. The browser reaches Selkies through the same proxy. One shared certificate, generated on first start, is what every seat trusts.
 
+The install order is [docs/deploy.md](docs/deploy.md): shared disk, passwords, nvkvm-kata, the gate, the label, then `kubectl apply`. [docs/nvkvm-kata.md](docs/nvkvm-kata.md) is the runtime detail behind steps 4 through 6 of that guide. `python3 deploy/render.py` refuses to print manifests while a secret or a Selkies password still contains `CHANGE_ME`.
+
 Kubernetes object names stay `gs-orchestrator`, `gs-proxy`, and `gamestream` unless you change them in [deploy/gs-config.yaml](deploy/gs-config.yaml).
 
 ## What you need
 
-- Kubernetes workers that have already passed [docs/nvkvm-kata.md](docs/nvkvm-kata.md). Do not apply a seat until that gate prints `GATE_OK` and the node is labeled `nvkvm.kata/ready=true`.
+- Kubernetes workers that have already passed [docs/nvkvm-kata.md](docs/nvkvm-kata.md). Do not apply a seat until that gate prints `GATE_OK` and the node is labeled `nvkvm.kata/ready=true`. The proxy DaemonSet requires that label as well as `nvidia.com/gpu.present=true`. Seats are pinned with `nodeName`, which does not re-check the RuntimeClass selector, so an unlabeled node must not be running a proxy.
 - A filesystem mounted at the same `PERSIST_ROOT` on every proxy node and on the orchestrator node.
 - The seat image imported on every GPU node, and the orchestrator image on the orchestrator node and every proxy node. Both processes are that one image, selected with `GS_ROLE`.
 - Traefik, or anything else that can route HTTP to Service `gs-proxy`. Moonlight does not go through that HTTP route. It dials the Sunshine ports on the proxy nodes.
 
 ## What listens where
 
-Proxies are a hostNetwork DaemonSet, one per GPU node. They select `nvidia.com/gpu.present=true` and do not request `nvidia.com/gpu`, so they do not consume a seat. The orchestrator is one Deployment with no GPU and no host network. It is the only kube API client. Each seat runs Sunshine on `SUNSHINE_BASE` (47989) and Selkies on `SELKIES_PORT` (8082). Clients never pair with a pod.
+Proxies are a hostNetwork DaemonSet, one per GPU node. They select `nvidia.com/gpu.present=true` and `nvkvm.kata/ready=true`, and do not request `nvidia.com/gpu`, so they do not consume a seat. The orchestrator is one Deployment with no GPU and no host network. It is the only kube API client. Each seat runs Sunshine on `SUNSHINE_BASE` (47989) and Selkies on `SELKIES_PORT` (8082). Clients never pair with a pod.
 
 | Client | Where it connects | What happens |
 |---|---|---|
@@ -106,13 +108,17 @@ Import the seat image on every GPU node. The orchestrator image has to be on the
 
 ## Apply
 
+Follow [docs/deploy.md](docs/deploy.md). The short form, after the gate, the label, the images, and the passwords:
+
 ```bash
 python3 deploy/render.py | kubectl apply -f -
 kubectl -n "$NS" rollout status deploy/gs-orchestrator
 kubectl -n "$NS" rollout status ds/gs-proxy
 ```
 
-`$NS` is `NAMESPACE`. Point Traefik at Service `gs-proxy`, not at the orchestrator. The orchestrator Service is how the proxies reach `POST /v1/ensure`.
+`$NS` is `NAMESPACE`. The command fails while `CHANGE_ME` is still in `users.csv` or the `gs-cookie` Secret. `python3 deploy/render.py --allow-placeholders` prints the manifests anyway; do not apply that output. The orchestrator and the proxy refuse to start if the cookie secret or `ADMIN_PASSWORD` is still a placeholder, if `PERSIST_MOUNT` is not a mount, or if `PERSIST_MOUNT/.sunslop-volume` is missing. Create that empty file once on the host at `PERSIST_ROOT/.sunslop-volume`. A node-local `DirectoryOrCreate` does not have it, so it cannot mint a second certificate.
+
+Point Traefik at Service `gs-proxy`, not at the orchestrator. The orchestrator Service is how the proxies reach `POST /v1/ensure`.
 
 Homes land on `<PERSIST_ROOT>/<login>`. The shared directory is `<PERSIST_ROOT>/<COMMON_DIR>`, mounted at `COMMON_MOUNT` in the seat (`/games`). The package layer is `<PERSIST_ROOT>/<LAYER_DIR>`, mounted at `LAYER_MOUNT` (`/gs-layer`). The proxy store is `<PERSIST_ROOT>/<PROXY_DIR>`. Both the proxy and the orchestrator mount `PERSIST_ROOT` at `PERSIST_MOUNT`. `COMMON_DIR`, `LAYER_DIR`, and `PROXY_DIR` are not legal logins. The desktop user inside the seat is `SEAT_USER` (`gsuser`, uid `SEAT_UID`), which is not a login name. The image's build-time account is overwritten from those values at boot. Rebuild the seat image only if you change packages in the Dockerfile, not if you rename the account.
 
@@ -205,6 +211,7 @@ python3 orchestrator/orchestrator.py --self-test
 python3 image/seat-boot.py --self-test
 python3 deploy/kata/gs_kata_shim.py --self-test
 bash deploy/kata/apply-desktop-kernel.sh --self-test
+python3 deploy/render.py --self-test
 cargo test --offline --manifest-path orchestrator/gs-relay/Cargo.toml
 ```
 
@@ -224,4 +231,5 @@ cargo test --offline --manifest-path orchestrator/gs-relay/Cargo.toml
 | [deploy/time-slicing.yaml](deploy/time-slicing.yaml) | shares per GPU |
 | [deploy/kata/gs_kata_shim.py](deploy/kata/gs_kata_shim.py) | Secure Boot pflash and the TPU emulator, in front of the nvkvm QEMU shim |
 | [deploy/kata/desktop.x86_64.conf](deploy/kata/desktop.x86_64.conf) | guest kernel fragment: uinput, ntsync, squashfs, 32-bit, dummy sound |
+| [docs/deploy.md](docs/deploy.md) | ordered install: disk, kata, gate, label, apply |
 | [docs/nvkvm-kata.md](docs/nvkvm-kata.md) | GPU-node runtime gate |

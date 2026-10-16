@@ -278,12 +278,28 @@ class Store:
         if not cert or not self.cert_path:
             return
         text = cert if str(cert).endswith("\n") else str(cert) + "\n"
-        tmp = self.cert_path + ".tmp"
-        with open(tmp, "w") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, self.cert_path)
+        data = text.encode()
+        try:
+            with open(self.cert_path, "rb") as fh:
+                current = fh.read()
+        except OSError:
+            current = b""
+        if current == data:
+            return
+        # The seat mounts this path as a hostPath file. That mount is the
+        # inode. os.replace would leave the seat reading the old empty file.
+        fd = os.open(self.cert_path, os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            os.ftruncate(fd, 0)
+            view = data
+            while view:
+                wrote = os.write(fd, view)
+                if wrote <= 0:
+                    raise OSError("short write publishing the proxy certificate")
+                view = view[wrote:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
         try:
             os.chmod(self.cert_path, 0o644)
         except OSError:
@@ -1612,6 +1628,16 @@ def self_test():
     store = Store(os.path.join(tempfile.mkdtemp(), "store.json"))
     assert os.path.isfile(store.cert_path)
     assert "BEGIN CERTIFICATE" in open(store.cert_path).read()
+    # A seat bind-mounts this inode. Rewriting the directory entry would not
+    # update that mount; the bytes have to change in place.
+    held = os.open(store.cert_path, os.O_RDONLY)
+    try:
+        store._publish("-----BEGIN CERTIFICATE-----\nNEW\n-----END CERTIFICATE-----\n")
+        os.lseek(held, 0, os.SEEK_SET)
+        seen = os.read(held, 4096)
+    finally:
+        os.close(held)
+    assert b"NEW" in seen, seen
     server = PairServer(store)
     cert, key_pem = store.server_material()[0], store.server_material()[1]
     again = Store(store.path, cert_path=store.cert_path)

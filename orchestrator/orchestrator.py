@@ -188,8 +188,8 @@ def load_users(text, reserved=None):
         name, password, base_s = parts
         if not _ok_name(name, blocked):
             raise ValueError(f"{lineno}: bad username {name!r}")
-        if not password:
-            raise ValueError(f"{lineno}: empty password")
+        if not password or password.startswith("CHANGE_ME"):
+            raise ValueError(f"{lineno}: password is empty or still the CHANGE_ME placeholder")
         base = int(base_s)
         if not 1029 <= base <= 65514:
             raise ValueError(f"{lineno}: base port {base} out of range")
@@ -802,8 +802,14 @@ def derive_storage(persist_root, common_dir, layer_dir, proxy_dir, persist_mount
 def load_config():
     secret_path = env_get("COOKIE_SECRET_FILE", "/etc/gamestream/cookie.secret")
     secret = open(secret_path, "rb").read().strip()
-    if len(secret) < 16:
-        raise SystemExit("cookie secret must be at least 16 bytes")
+    if len(secret) < 16 or b"CHANGE_ME" in secret:
+        raise SystemExit("cookie secret must be at least 16 bytes and must not be the CHANGE_ME placeholder")
+    admin_password = os.environ.get("ADMIN_PASSWORD", "")
+    if not admin_password.strip() or "CHANGE_ME" in admin_password:
+        raise SystemExit(
+            "ADMIN_PASSWORD is empty or still the CHANGE_ME placeholder. "
+            "An empty password would leave /admin open on the proxy."
+        )
     flag = env_get("CERT_PROXY", "true").lower()
     persist_root = env_get("PERSIST_ROOT", "/var/lib/gamestream/persistent")
     common_dir = _dir_name(env_get("COMMON_DIR", "common"), "COMMON_DIR")
@@ -876,7 +882,7 @@ def load_config():
         cpu_limit=env_get("SEAT_CPU_LIMIT", "8"),
         cert_proxy=flag not in ("0", "false", "no"),
         proxy_store=proxy_store,
-        admin_password=os.environ.get("ADMIN_PASSWORD", ""),
+        admin_password=admin_password,
         sunshine_web_user=os.environ.get("SUNSHINE_WEB_USER", ""),
         sunshine_web_password=os.environ.get("SUNSHINE_WEB_PASSWORD", ""),
         common_dir=common_dir,
@@ -927,6 +933,17 @@ def load_config():
         tpu_emulation=tpu_emulation,
         tpu_state_dir=tpu_state_dir,
     )
+
+
+def probe_failures(ready_timeout, period=2):
+    """Kubelet checks for the labwc socket this many times.
+
+    period seconds times this count has to cover READY_TIMEOUT. A shorter
+    probe marks the seat NotReady while the first layer copy is still running,
+    and the orchestrator then reports that the pod never became ready.
+    """
+    ready = max(int(ready_timeout), period)
+    return max(1, (ready + period - 1) // period)
 
 
 def kata_annotations(cfg, home, activity):
@@ -1053,7 +1070,7 @@ def seat_pod(cfg, user, gpu, node=None):
                         "exec": {"command": ["/bin/bash", "-lc", f"test -S {wayland}"]},
                         "initialDelaySeconds": 3,
                         "periodSeconds": 2,
-                        "failureThreshold": 450,
+                        "failureThreshold": probe_failures(cfg.ready_timeout),
                     },
                     "resources": {"requests": requests, "limits": limits},
                     "volumeMounts": mounts,
@@ -1720,6 +1737,48 @@ class OrchestratorApi:
         server.serve_forever()
 
 
+def require_persist_mount(path):
+    """The certificate store has to be the shared disk, not a local directory.
+
+    A hostPath that was never mounted shows up as a subdirectory of `/`.
+    Starting anyway creates a second certificate that the other node will
+    not trust. GS_PERSIST_ALLOW_UNMOUNTED=1 is only for a local run.
+    """
+    if os.environ.get("GS_PERSIST_ALLOW_UNMOUNTED", "") == "1":
+        log(f"persist: {path} mount check skipped")
+        return
+    real = os.path.realpath(path)
+    best = None
+    try:
+        mounts = open("/proc/mounts")
+    except OSError as exc:
+        raise SystemExit(f"persist: cannot read mounts: {exc}") from exc
+    with mounts:
+        for line in mounts:
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            mnt = os.path.realpath(parts[1].replace("\\040", " "))
+            if real == mnt or real.startswith(mnt.rstrip("/") + "/"):
+                if best is None or len(mnt) > len(best[0]):
+                    best = (mnt, parts[0], parts[2])
+    if best is None or best[0] != real:
+        raise SystemExit(
+            f"{path} is not a mount. Refusing to start, because a local directory "
+            "would mint a second certificate. The pod must mount the shared "
+            "PERSIST_ROOT at this path. GS_PERSIST_ALLOW_UNMOUNTED=1 is only for a local run."
+        )
+    marker = os.path.join(real, ".sunslop-volume")
+    if not os.path.isfile(marker):
+        raise SystemExit(
+            f"{marker} is missing. On the shared filesystem, run "
+            "`touch <PERSIST_ROOT>/.sunslop-volume` once, and confirm every "
+            "proxy node and the orchestrator node see that same file. "
+            "A node-local directory would mint a second certificate."
+        )
+    log(f"persist: {path} is {best[1]} ({best[2]})")
+
+
 def publish_proxy_cert(cfg):
     import moonlight_proxy
     moonlight_proxy.Store(cfg.proxy_store, cert_path=cfg.proxy_cert_publish or None)
@@ -1758,6 +1817,13 @@ def self_test():
         raise SystemExit("configured dir accepted as a login")
     except ValueError:
         pass
+    try:
+        load_users("gsuser0,CHANGE_ME_selkies_password,47989\n")
+        raise SystemExit("placeholder password accepted")
+    except ValueError:
+        pass
+    assert probe_failures(900) == 450
+    assert probe_failures(901) == 451
     secret = b"0123456789abcdef"
     tok = issue_token("gsuser0", secret, 100, now=1_000)
     assert read_token(tok, secret, now=1_050) == "gsuser0"
@@ -2120,6 +2186,7 @@ def main():
         self_test()
         return 0
     cfg = load_config()
+    require_persist_mount(cfg.persist_mount)
     directory = Directory(cfg.users_file, reserved_names(cfg.common_dir, cfg.layer_dir, cfg.proxy_dir))
     if cfg.role == "proxy":
         publish_proxy_cert(cfg)

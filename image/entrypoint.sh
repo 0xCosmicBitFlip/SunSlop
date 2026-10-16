@@ -227,7 +227,7 @@ fi
 for g in render video input audio; do
   getent group "$g" >/dev/null && usermod -aG "$g" "$user" || true
 done
-chown "${user}:${user}" "$runtime" "$home" || true
+chown "${user}:${user}" "$runtime" "$home"
 
 install -d -o "$user" -g "$user" "${home}/.config/labwc" "${home}/${config_rel}"
 if [[ ! -e ${home}/.config/labwc/autostart ]]; then

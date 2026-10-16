@@ -49,7 +49,12 @@ spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       nodeSelector:
+        # gpu.present is the GPU Operator. The kata label is the gate in
+        # docs/nvkvm-kata.md. Seats are pinned with nodeName, which does not
+        # re-check the RuntimeClass selector, so a proxy must not run here
+        # until that gate has passed.
         nvidia.com/gpu.present: "true"
+        nvkvm.kata/ready: "true"
       containers:
         - name: proxy
           image: ${ORCH_IMAGE}

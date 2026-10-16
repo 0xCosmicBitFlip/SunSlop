@@ -1,6 +1,6 @@
 # nvkvm-kata on the GPU nodes
 
-Do this on every CentOS Stream 9 worker before `python3 deploy/render.py | kubectl apply -f -`. Seats are not applied by hand. The orchestrator creates one when a client connects, and it will not schedule until this node is labeled `nvkvm.kata/ready=true`.
+This is steps 4 through 6 of [deploy.md](deploy.md). Do that page in order. Do not `kubectl apply` the SunSlop manifests, and do not label the node `nvkvm.kata/ready=true`, until the gate at the bottom of this page prints `GATE_OK`.
 
 The workers already run the NVIDIA driver and the GPU Operator. Keep both. This runtime does not replace them.
 
@@ -143,7 +143,7 @@ The GPU Operator rewrites containerd config when the toolkit DaemonSet restarts.
 
 ## RuntimeClass
 
-The installer does not create the Kubernetes object. Apply this once per cluster:
+The installer does not create the Kubernetes object. For the gate, apply this class with no `scheduling` stanza. SunSlop's later apply replaces it and adds `nvkvm.kata/ready=true`. Admission copies that selector onto every pod using the class, and the kubelet rejects the gate pod on an unlabeled node even when `nodeName` is set.
 
 ```yaml
 apiVersion: node.k8s.io/v1
@@ -155,9 +155,6 @@ overhead:
   podFixed:
     cpu: "250m"
     memory: 512Mi
-scheduling:
-  nodeSelector:
-    nvkvm.kata/ready: "true"
 ```
 
 Do not label the node yet. The label is the last step, after the gate passes. The handler string has to be the containerd runtime key, which is `nvkvm-kata` unless you changed `--runtime-name`.
@@ -271,7 +268,7 @@ kubectl -n "$NS" wait --for=jsonpath='{.status.phase}'=Succeeded pod/nvkvm-gate 
 kubectl -n "$NS" logs pod/nvkvm-gate
 ```
 
-The RuntimeClass above has a node selector, so this pod will not schedule until you either label the node or delete the `scheduling` block for the duration of the test. Easiest path: apply the RuntimeClass **without** the `scheduling` stanza, run the gate, then add the stanza and the label.
+The class above has no node selector, so this pod can run before the label exists. If SunSlop has already been applied, the class has `nvkvm.kata/ready=true` and the kubelet will reject this pod. Put the no-selector class back, run the gate, label the node, then apply SunSlop again.
 
 Required before any streaming pod:
 
@@ -305,7 +302,7 @@ NODE=gpu-node-1
 kubectl label node "$NODE" nvkvm.kata/ready=true
 ```
 
-Repeat the install and the gate on the second node. Then follow [the deploy guide](../README.md).
+Repeat the install and the gate on the next node. Then continue at step 8 of [deploy.md](deploy.md). The proxy will not start on this node until the label is present.
 
 ## After a driver upgrade
 
