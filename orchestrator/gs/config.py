@@ -76,6 +76,9 @@ class Config:
     kata_secure_boot: bool = True
     tpu_emulation: bool = True
     tpu_state_dir: str = "tpu"
+    ovn_back_subnet: str = "ovn-default"
+    ovn_front_network: str = "cs1-resident"
+    ovn_front_nad_ns: str = "default"
 
 
 def env_get(name, default):
@@ -266,6 +269,9 @@ def load_config():
         kata_secure_boot=kata_secure_boot,
         tpu_emulation=tpu_emulation,
         tpu_state_dir=tpu_state_dir,
+        ovn_back_subnet=_safe(env_get("OVN_BACK_SUBNET", "ovn-default"), "OVN_BACK_SUBNET"),
+        ovn_front_network=_safe(env_get("OVN_FRONT_NETWORK", "cs1-resident"), "OVN_FRONT_NETWORK"),
+        ovn_front_nad_ns=_safe(env_get("OVN_FRONT_NAD_NS", "default"), "OVN_FRONT_NAD_NS"),
     )
 
 

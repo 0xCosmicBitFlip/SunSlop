@@ -111,6 +111,8 @@ def self_test():
     assert pod["metadata"]["annotations"][ACTIVITY].isdigit()
     ann = pod["metadata"]["annotations"]
     assert ann["io.katacontainers.config.hypervisor.firmware"].endswith("OVMF_CODE.secboot.fd")
+    assert ann["ovn.kubernetes.io/logical_switch"] == "ovn-default"
+    assert "cs1-resident" not in ann.values()
     boot = ann["io.katacontainers.config.hypervisor.kernel_params"]
     assert "sunslop.tpu_state=/data/persist/gsuser0/tpu" in boot
     assert "sunslop.uefi_vars=/data/persist/gsuser0/uefi/OVMF_VARS.fd" in boot
@@ -195,6 +197,18 @@ def self_test():
     kind, info = Place("local", "10.0.0.5", "1.2.3.4", "n1")
     assert kind == "local" and info == "10.0.0.5"
     assert "host" not in HOP
+    plain = {"status": {"hostIP": "9.9.9.9"}, "metadata": {"annotations": {}}}
+    assert advertise_host(plain) == "9.9.9.9"
+    front_pod = {
+        "status": {"hostIP": "9.9.9.9"},
+        "metadata": {"annotations": {
+            "cs1-resident.default.ovn.kubernetes.io/ip_address": "5.5.5.5/24",
+        }},
+    }
+    assert advertise_host(front_pod, "cs1-resident", "default") == "5.5.5.5"
+    assert advertise_host(front_pod) == "9.9.9.9"
+    front_pod["metadata"]["annotations"][ADVERTISE] = "1.2.3.4"
+    assert advertise_host(front_pod, "cs1-resident", "default") == "1.2.3.4"
     _component_test()
     print("self-test ok")
 
@@ -209,9 +223,15 @@ def _component_test():
 
     def front(node, ip):
         return {
-            "metadata": {"name": "proxy-" + node, "labels": {"app": "gs-proxy"}, "annotations": {}},
+            "metadata": {
+                "name": "proxy-" + node,
+                "labels": {"app": "gs-proxy"},
+                "annotations": {
+                    "cs1-resident.default.ovn.kubernetes.io/ip_address": ip,
+                },
+            },
             "spec": {"nodeName": node},
-            "status": {"phase": "Running", "hostIP": ip},
+            "status": {"phase": "Running", "hostIP": "10.9.9.9"},
         }
 
     class Kube:

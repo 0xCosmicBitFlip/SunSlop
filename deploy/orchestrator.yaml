@@ -6,16 +6,22 @@
 # Site values come from deploy/gs-config.yaml. Apply with:
 #   python3 deploy/render.py | kubectl apply -f -
 #
-# Moonlight dials the Sunshine ports on any proxy node. The client
-# certificate selects the user. If the seat is on another node, Moonlight is
-# given that node's address and then reset so it retries there. Selkies
-# is http on HTTP_PORT on the proxy. Put Traefik in front of Service/${PROXY_NAME}.
-# /admin on that same port pairs clients.
+# Moonlight dials the Sunshine ports on a proxy's cs1-resident address.
+# The client certificate selects the user. If the seat is on another node,
+# Moonlight is given that proxy's front address and then reset so it retries
+# there. Selkies is http on HTTP_PORT. Put Traefik in front of
+# Service/${PROXY_NAME} on the back network. /admin on that same port pairs
+# clients. The orchestrator itself is only on OVN_BACK_SUBNET.
 
 apiVersion: v1
 kind: Namespace
 metadata:
   name: ${NAMESPACE}
+  annotations:
+    # Same subnet the default namespace uses. Pods in this namespace that
+    # do not set logical_switch still land here when kube-ovn honors the
+    # namespace annotation. The workloads below set it themselves.
+    ovn.kubernetes.io/logical_switch: ${OVN_BACK_SUBNET}
 ---
 apiVersion: node.k8s.io/v1
 kind: RuntimeClass
@@ -126,6 +132,8 @@ spec:
     metadata:
       labels:
         app: ${ORCH_NAME}
+      annotations:
+        ovn.kubernetes.io/logical_switch: ${OVN_BACK_SUBNET}
     spec:
       serviceAccountName: ${ORCH_NAME}
       containers:

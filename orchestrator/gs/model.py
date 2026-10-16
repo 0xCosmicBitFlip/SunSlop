@@ -13,6 +13,16 @@ SUNSHINE_BASE = 47989  # every seat listens here, whatever the client dialed
 ACTIVITY = "gamestream.local/last-activity"
 ADVERTISE = "gamestream.local/advertise"
 
+
+def _address(value):
+    """First address, without a CIDR prefix. Kube-OVN writes both forms."""
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    raw = raw.split(",")[0].strip()
+    return raw.split("/")[0].strip()
+
+
 HOP = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade",
@@ -71,12 +81,24 @@ def pick_node(prefer, nodes, has_room):
     return None, ""
 
 
-def advertise_host(pod):
+def advertise_host(pod, front_network="", front_ns=""):
+    """Address clients should dial for this proxy.
+
+    A manual gamestream.local/advertise wins. Otherwise the kube-ovn
+    address on the front attachment (cs1-resident) is the one Moonlight
+    can reach. The node hostIP is only the fallback when no front
+    network is configured, which is a hostNetwork pod.
+    """
     ann = ((pod.get("metadata") or {}).get("annotations") or {})
-    stamped = (ann.get(ADVERTISE) or "").strip()
+    stamped = _address(ann.get(ADVERTISE) or "")
     if stamped:
         return stamped
-    return ((pod.get("status") or {}).get("hostIP") or "").strip()
+    network = (front_network or "").strip()
+    ns = (front_ns or "").strip()
+    if network and ns:
+        key = "%s.%s.ovn.kubernetes.io/ip_address" % (network, ns)
+        return _address(ann.get(key) or "")
+    return _address(((pod.get("status") or {}).get("hostIP") or ""))
 
 
 def api_token(secret):

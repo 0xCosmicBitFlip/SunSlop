@@ -13,17 +13,19 @@ Kubernetes object names stay `gs-orchestrator`, `gs-proxy`, and `gamestream` unl
 - Kubernetes workers that have already passed [docs/nvkvm-kata.md](docs/nvkvm-kata.md). Do not apply a seat until that gate prints `GATE_OK` and the node is labeled `nvkvm.kata/ready=true`. The proxy DaemonSet requires that label as well as `nvidia.com/gpu.present=true`. Seats are pinned with `nodeName`, which does not re-check the RuntimeClass selector, so an unlabeled node must not be running a proxy.
 - A filesystem mounted at the same `PERSIST_ROOT` on every proxy node and on the orchestrator node.
 - The seat image imported on every GPU node, and one control-plane image (`ORCH_IMAGE`) on the orchestrator node and every proxy node. The orchestrator Deployment and the proxy DaemonSet use that same image. `GS_ROLE` on the pod is what the entrypoint runs: `orchestrator` starts `orchestrator.py`, `proxy` compiles `gs-relay` and starts `moonlight_proxy.py`.
-- Traefik, or anything else that can route HTTP to Service `gs-proxy`. Moonlight does not go through that HTTP route. It dials the Sunshine ports on the proxy nodes.
+- Traefik, or anything else that can route HTTP to Service `gs-proxy` on the back network. Moonlight does not go through that HTTP route. It dials the Sunshine ports on the proxy's `cs1-resident` address.
 
 ## What listens where
 
-Proxies are a hostNetwork DaemonSet, one per GPU node. They select `nvidia.com/gpu.present=true` and `nvkvm.kata/ready=true`, and do not request `nvidia.com/gpu`, so they do not consume a seat. The orchestrator is one Deployment with no GPU and no host network. It is the only kube API client. Each seat runs Sunshine on `SUNSHINE_BASE` (47989) and Selkies on `SELKIES_PORT` (8082). Clients never pair with a pod.
+Proxies are a DaemonSet, one per GPU node, with two kube-ovn interfaces. The primary NIC is `OVN_BACK_SUBNET` (the subnet the `default` namespace uses, `ovn-default` unless that namespace was moved). The orchestrator and every seat use only that network, and that is how the proxy reaches Service `gs-orchestrator` and the seat pod IPs. The second NIC is the attachment `OVN_FRONT_NAD_NS/OVN_FRONT_NETWORK` (`default/cs1-resident`). Moonlight dials the address kube-ovn assigns there. The default route stays on the back NIC. There is no `hostNetwork` and no `hostPort`.
+
+The proxy selects `nvidia.com/gpu.present=true` and `nvkvm.kata/ready=true`, and does not request `nvidia.com/gpu`, so it does not consume a seat. The orchestrator is one Deployment with no GPU. It is the only kube API client. Each seat runs Sunshine on `SUNSHINE_BASE` (47989) and Selkies on `SELKIES_PORT` (8082). Clients never pair with a pod.
 
 | Client | Where it connects | What happens |
 |---|---|---|
-| Moonlight | Any proxy, `SUNSHINE_BASE` and `SUNSHINE_BASE` + `SUNSHINE_HTTPS_OFFSET` | Pairing and unpaired `serverinfo` stay on the proxy. TLS is terminated, the client certificate selects the login, and a second TLS session to the seat presents the shared proxy certificate. A seat on another node is not spliced. |
-| Browser | Traefik to Service `gs-proxy` port `HTTP_PORT` (8080) | Password form, then a reverse proxy to that user's Selkies, only when the seat is on this proxy's node. |
-| Admin | `http://<proxy>:HTTP_PORT/admin` | Type the PIN Moonlight is showing. Unpair a client. |
+| Moonlight | Any proxy's `cs1-resident` address, `SUNSHINE_BASE` and `SUNSHINE_BASE` + `SUNSHINE_HTTPS_OFFSET` | Pairing and unpaired `serverinfo` stay on the proxy. TLS is terminated, the client certificate selects the login, and a second TLS session to the seat presents the shared proxy certificate. A seat on another node is not spliced. |
+| Browser | Traefik to Service `gs-proxy` port `HTTP_PORT` (8080), on the back network | Password form, then a reverse proxy to that user's Selkies, only when the seat is on this proxy's node. |
+| Admin | `http://<front-address>:HTTP_PORT/admin`, or the Traefik URL | Type the PIN Moonlight is showing. Unpair a client. |
 
 ## Configure
 
@@ -36,7 +38,7 @@ Two values in that file are site paths, not secrets, and the committed defaults 
 | `NAMESPACE` | `gamestream` | Your namespace. |
 | `PERSIST_ROOT` | `/var/lib/gamestream/persistent` | The shared host directory. The same string on every node. |
 
-Logins and the Selkies passwords live in `users.csv` inside [deploy/orchestrator.yaml](deploy/orchestrator.yaml). The cookie HMAC key and the admin password live in the `gs-cookie` Secret in that same file. The committed values are placeholders. Replace them before `kubectl apply`. An empty `admin.password` leaves `/admin` open on a hostNetwork port.
+Logins and the Selkies passwords live in `users.csv` inside [deploy/orchestrator.yaml](deploy/orchestrator.yaml). The cookie HMAC key and the admin password live in the `gs-cookie` Secret in that same file. The committed values are placeholders. Replace them before `kubectl apply`. An empty `admin.password` leaves `/admin` open on the proxy.
 
 ```
 username,password,sunshine_base_port
@@ -86,13 +88,13 @@ After TLS has identified the client, the source address is stuck to that pod, an
 
 Proxies have the addresses clients can reach. The orchestrator may place the seat on a different GPU node. `HTTP_FOREIGN` is the same switch for Moonlight and for Selkies. An existing seat is not moved. A new seat is placed on the asking proxy's node when that GPU has room.
 
-- `redirect` (the default). Selkies is a browser, so it gets HTTP 307 to the owning proxy (`hostIP`, or the pod annotation `gamestream.local/advertise`, wrapped by `PUBLIC_HTTP_BASE`). Moonlight's control channel is also HTTP, and Qt 6 and the Android client will follow a 307, but that does not move the stream. RTSP and UDP are opened to the address that answered, not to the Location host. Moonlight stores `LocalIP` and `ExternalIP` from `serverinfo` and polls those next. Desktop tries the current address first, then the stored one. Android tries `LocalIP` first. The wrong proxy answers one `serverinfo` with the owning proxy's address, then RSTs. The next poll fails here, succeeds on the owning proxy, and that becomes the stream address. Pairing is not redirected.
+- `redirect` (the default). Selkies is a browser, so it gets HTTP 307 to the owning proxy (that pod's `cs1-resident` address, or the pod annotation `gamestream.local/advertise`, wrapped by `PUBLIC_HTTP_BASE`). Moonlight's control channel is also HTTP, and Qt 6 and the Android client will follow a 307, but that does not move the stream. RTSP and UDP are opened to the address that answered, not to the Location host. Moonlight stores `LocalIP` and `ExternalIP` from `serverinfo` and polls those next. Desktop tries the current address first, then the stored one. Android tries `LocalIP` first. The wrong proxy answers one `serverinfo` with the owning proxy's front address, then RSTs. The next poll fails here, succeeds on the owning proxy, and that becomes the stream address. Pairing is not redirected.
 - `reset`: Moonlight gets a TCP RST (`SO_LINGER` 0, not a TLS close) so this address fails and the client tries the next one it already has. The browser gets the retry page instead of a 307.
 - `proxy`: both are spliced to the pod IP. Moonlight only does this when the pod IP is already known; otherwise it uses the redirect behavior above. Prefer `redirect`. A spliced `serverinfo` or `launch` is rewritten on the way out: `LocalIP`, `uniqueid`, and the RTSP url use the host the client dialed, not the pod address Sunshine saw.
 
 UDP and RTSP have no redirect. They show up on the owning proxy only after the client has moved.
 
-One public VIP in front of every proxy is not enough for that hand-off. The address written into `serverinfo` has to be reachable as that node. Set `gamestream.local/advertise` on each proxy pod when the node IP is not the address clients dial. `PUBLIC_HTTP_BASE` is `https://{host}` when Traefik terminates TLS for Selkies.
+One public VIP in front of every proxy is not enough for that hand-off. The address written into `serverinfo` is the kube-ovn address on `cs1-resident` (`<network>.<namespace>.ovn.kubernetes.io/ip_address`). Set `gamestream.local/advertise` on a proxy pod when that address is not what clients should store. The node IP is not advertised. `PUBLIC_HTTP_BASE` is `https://{host}` when Traefik terminates TLS for Selkies. Traefik stays on the back network.
 
 ## Build
 
@@ -245,7 +247,7 @@ cargo test --offline --manifest-path orchestrator/gs-relay/Cargo.toml
 | [deploy/gs-config.yaml](deploy/gs-config.yaml) | site paths, account, ports, images |
 | [deploy/render.py](deploy/render.py) | copies the ConfigMap into the other manifests |
 | [deploy/orchestrator.yaml](deploy/orchestrator.yaml) | Deployment, RBAC, users, cookie Secret |
-| [deploy/proxy.yaml](deploy/proxy.yaml) | DaemonSet, hostNetwork, no GPU request |
+| [deploy/proxy.yaml](deploy/proxy.yaml) | DaemonSet. Back NIC `ovn-default`, front NIC `cs1-resident`. No GPU request |
 | [image/](image) | seat image: labwc, Sunshine, Selkies, package layer, seat-boot |
 | [image/layer-init.sh](image/layer-init.sh) | init container: the only writer of the shared layer |
 | [deploy/seat-direct.yaml](deploy/seat-direct.yaml) | one pod, no orchestrator |

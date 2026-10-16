@@ -9,6 +9,7 @@ Two longer references, if a step here is not enough: [nvkvm-kata.md](nvkvm-kata.
 ## 1. Cluster that is already there
 
 - Kubernetes, with the NVIDIA GPU Operator in its normal mode. Host `nvidia` module, `nvidia.com/gpu` advertised by the device plugin.
+- Kube-OVN is the pod network, and Multus is installed. Two networks already exist. The back network is the subnet the `default` namespace uses (`ovn-default` unless you moved that namespace). The front network is the kube-ovn attachment `cs1-resident`: a NetworkAttachmentDefinition of that name in the `default` namespace, provider `cs1-resident.default.ovn`, and a Subnet of the same name. Clients dial the front address. The orchestrator, the proxy, and the seats talk to each other on the back network. The proxy is the only pod that has both.
 - Do not enable `sandboxWorkloads` and do not bind the GPUs to `vfio-pci`. That takes the card away from nvkvm. Details are in [nvkvm-kata.md](nvkvm-kata.md).
 - A filesystem you can mount at the same path on the orchestrator node and on every GPU node. NFS with `root_squash` will not work: the seat `chown`s the home directory to the desktop user.
 - `ctr` (or an equivalent) so you can import images on the nodes. The manifests use `imagePullPolicy: IfNotPresent` and the default names are local tags, not a registry.
@@ -35,6 +36,9 @@ Edit [deploy/gs-config.yaml](../deploy/gs-config.yaml):
 | Key | What to set |
 |---|---|
 | `NAMESPACE` | The namespace. The gate pod in step 6 uses the same one. |
+| `OVN_BACK_SUBNET` | The subnet the `default` namespace uses. Leave `ovn-default` if that is still it. |
+| `OVN_FRONT_NETWORK` | The client attachment. Leave `cs1-resident` if that NAD and subnet already have that name. |
+| `OVN_FRONT_NAD_NS` | Namespace of that NetworkAttachmentDefinition. `default` unless you put the NAD somewhere else. |
 | `PERSIST_ROOT` | The host path from step 2. |
 | `ORCH_IMAGE`, `SEAT_IMAGE` | The tags you import in step 8, if not `gs-orchestrator:local` and `gamestream:local`. |
 | `GPU_COUNT` | How many GPUs each worker has. |
@@ -200,11 +204,11 @@ kubectl -n "$NS" rollout status ds/gs-proxy
 kubectl -n "$NS" logs deploy/gs-orchestrator | head
 ```
 
-The orchestrator log line `persist: ...` is the mount it actually got. If a proxy stays Pending, the node is missing one of the two labels from step 7.
+The orchestrator log line `persist: ...` is the mount it actually got. If a proxy stays Pending, the node is missing one of the two labels from step 7, or `cs1-resident` is not a NetworkAttachmentDefinition in `OVN_FRONT_NAD_NS`. A seat that starts on a different subnet than the proxy cannot be reached: both must be on `OVN_BACK_SUBNET`. If kube-ovn has already bound this namespace to some other subnet, add `${NAMESPACE}` to the back subnet's `spec.namespaces` and take it off the other one.
 
 This apply replaces the RuntimeClass from step 6 and adds the node selector. That is what you want once the nodes are labeled.
 
-Point Traefik at Service `gs-proxy`, port `HTTP_PORT` (8080), not at the orchestrator. The orchestrator Service is only how the proxies call `POST /v1/ensure`.
+Point Traefik at Service `gs-proxy`, port `HTTP_PORT` (8080), not at the orchestrator. That Service is on the back network. The orchestrator Service is only how the proxies call `POST /v1/ensure`, also on the back network. Do not point Moonlight at either Service.
 
 Optional, and idle until the device plugin is told to use it:
 
@@ -216,9 +220,11 @@ Do not apply `python3 deploy/render.py --seat`. That is one pod with no proxy, f
 
 ## 10. Ports
 
-Moonlight does not go through Traefik. Each GPU node's address has to accept the Sunshine family. One public VIP in front of every proxy breaks the hand-off: the address written into `serverinfo` has to be that node. Set pod annotation `gamestream.local/advertise` on a proxy when the node IP is not the address clients dial.
+Moonlight does not go through Traefik, and it does not dial the node address. Each proxy pod has a second address on `cs1-resident`. That is the address written into `serverinfo`. One public VIP in front of every proxy breaks the hand-off. `gamestream.local/advertise` on a proxy pod replaces the kube-ovn front address when clients should store something else. The node `hostIP` is not used.
 
-With `SUNSHINE_BASE` 47989, open these from the client network to every GPU node:
+The proxy listens on all of its interfaces. Packets from clients arrive on the front NIC. Replies use that same address. The default route stays on the back NIC, so the proxy still reaches the orchestrator Service and the seat pod IPs. Do not put the Sunshine ports on the back subnet's firewall policy for clients. Clients are on the front network.
+
+With `SUNSHINE_BASE` 47989, open these from the client network to each proxy's `cs1-resident` address:
 
 | Port | Proto | Why |
 |---|---|---|
@@ -226,16 +232,24 @@ With `SUNSHINE_BASE` 47989, open these from the client network to every GPU node
 | 47989 | TCP | HTTP pairing and unpaired `serverinfo`. |
 | 47998, 47999, 48000, 48002, 48010 | UDP | Video, control, audio, the extra stream, and the RTSP UDP port. |
 | 48010 | TCP | RTSP. |
-| 8080 | TCP | Selkies and `/admin`. Traefik may be the path browsers use. The process still binds port 8080 on the node, so firewall this to the client network too. |
+| 8080 | TCP | Selkies and `/admin`, if a browser dials the front address directly. Traefik on the back network is the usual path, and it uses Service `gs-proxy` instead of this address. |
 
 Do not publish 47990. That is Sunshine's own web UI, and only the seat listens.
 
 `/admin` pairs a Moonlight device to a login. Treat `admin.password` as a staff credential. Anyone who can open it can attach a client certificate to a user.
 
+Confirm the split after the first proxy is Running:
+
+```bash
+kubectl -n gamestream get pod -l app=gs-proxy -o jsonpath='{range .items[*]}{.spec.nodeName}{" back="}{.metadata.annotations.ovn\.kubernetes\.io/ip_address}{" front="}{.metadata.annotations.cs1-resident\.default\.ovn\.kubernetes\.io/ip_address}{"\n"}{end}'
+```
+
+`back` and `front` must be different addresses. Moonlight uses `front`.
+
 ## 11. Pair
 
-1. In Moonlight, add the address of any GPU node and start pairing. The PIN is on the client. The request waits up to 10 minutes.
-2. Open `http://<that-node>:8080/admin` (or the Traefik URL), enter `admin.password`, type the four digits, and pick the login.
+1. In Moonlight, add the `cs1-resident` address of any proxy and start pairing. The PIN is on the client. The request waits up to 10 minutes. The node IP will not answer.
+2. Open `http://<front-address>:8080/admin` (or the Traefik URL on the back network), enter `admin.password`, type the four digits, and pick the login.
 3. The certificate is stored at `<PERSIST_ROOT>/proxy/store.json`. The public half is `<PERSIST_ROOT>/proxy/proxy-client.crt`. Every seat mounts that file and trusts it at boot. `/admin` shows whether each login's state file contains it.
 4. Open the host in Moonlight. `applist` or launch is what creates the seat. A `serverinfo` poll does not. The seat's init container is the only writer of the shared package layer. The first one copies `/usr`, `/etc`, and `/opt` and may install RPMs, so the first connection can take most of `READY_TIMEOUT` (900 seconds). The desktop container then mounts `/usr` and `/opt` read-only and a private `/etc`. It has no `CAP_SYS_ADMIN`, so root in the seat cannot remount the layer or change `/games`. The pod is Ready when labwc's socket exists.
 5. An open Moonlight window keeps that seat up: the HTTPS `serverinfo` poll resets the idle timer. Closing Moonlight, with no browser session and no UDP, deletes the pod after `IDLE_SECONDS`. The home directory remains.

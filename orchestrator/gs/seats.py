@@ -156,7 +156,9 @@ class Seats:
             if not node:
                 continue
             app = ((pod.get("metadata") or {}).get("labels") or {}).get("app")
-            host = advertise_host(pod)
+            host = advertise_host(
+                pod, self.cfg.ovn_front_network, self.cfg.ovn_front_nad_ns
+            )
             if node not in out or app == self.cfg.proxy_label:
                 out[node] = host or out.get(node, "")
         return out
@@ -275,6 +277,8 @@ def kata_annotations(cfg, home, activity):
         params.append("sunslop.tpu_state=%s/%s" % (home, cfg.tpu_state_dir))
     if params:
         ann["io.katacontainers.config.hypervisor.kernel_params"] = " ".join(params)
+    if cfg.ovn_back_subnet:
+        ann["ovn.kubernetes.io/logical_switch"] = cfg.ovn_back_subnet
     return ann
 
 

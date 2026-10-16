@@ -12,6 +12,7 @@ metadata:
     gamestream.local/user: ${SEAT_DIRECT_USER}
     gamestream.local/gpu: "${SEAT_DIRECT_GPU}"
   annotations:
+    ovn.kubernetes.io/logical_switch: ${OVN_BACK_SUBNET}
     io.katacontainers.config.hypervisor.default_vcpus: "${SEAT_CPU_LIMIT}"
     io.katacontainers.config.hypervisor.default_memory: "${KATA_MEMORY_MIB}"
     io.katacontainers.config.hypervisor.firmware: ${KATA_FIRMWARE}

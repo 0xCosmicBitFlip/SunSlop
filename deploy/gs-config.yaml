@@ -21,6 +21,19 @@ data:
   SEAT_IMAGE: "gamestream:local"
   RUNTIME_CLASS: "nvkvm-kata"
 
+  # Back network. The kube-ovn subnet the default namespace already uses
+  # (ovn-default unless that namespace was moved). The orchestrator, the
+  # proxy, and every seat take an address here and talk to each other on
+  # it. This is not the network clients dial.
+  OVN_BACK_SUBNET: "ovn-default"
+  # Front network. Only the proxy attaches this. The NAD and the subnet
+  # are both named cs1-resident. The NAD is in OVN_FRONT_NAD_NS, and its
+  # provider is <name>.<namespace>.ovn. Moonlight dials the address
+  # kube-ovn writes on that attachment. The default route stays on the
+  # back network.
+  OVN_FRONT_NETWORK: "cs1-resident"
+  OVN_FRONT_NAD_NS: "default"
+
   # Host disk, the same shared filesystem on every proxy node and on the
   # node that runs the orchestrator. Create <PERSIST_ROOT>/.sunslop-volume
   # on that filesystem before apply. A node-local empty directory is refused

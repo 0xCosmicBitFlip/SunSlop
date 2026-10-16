@@ -1,13 +1,21 @@
 # One proxy per GPU node. Same image as the orchestrator. GS_ROLE=proxy
-# compiles gs-relay, then starts moonlight_proxy.py. hostNetwork publishes
-# HTTP_PORT and the Sunshine family on the node. Do not request
+# compiles gs-relay, then starts moonlight_proxy.py. Do not request
 # nvidia.com/gpu: that would consume a seat. nvidia.com/gpu.present only
 # selects the nodes. This pod has no kube token. It asks Service/${ORCH_NAME}
 # to create seats.
 #
+# Two networks. The primary NIC is OVN_BACK_SUBNET, the kube-ovn subnet the
+# default namespace uses. The orchestrator Service and the seat pod IPs are
+# on that network, and that NIC keeps the default route. The second NIC is
+# the kube-ovn attachment OVN_FRONT_NAD_NS/OVN_FRONT_NETWORK (cs1-resident).
+# Moonlight dials the address kube-ovn assigns there. There is no
+# hostNetwork and no hostPort. A manual gamestream.local/advertise replaces
+# that address when the front IP is not what clients should store.
+#
 # Moonlight that lands here while the seat is on another node is told that
-# node's address, then reset so it retries there. Selkies is redirected
-# (HTTP 307) unless HTTP_FOREIGN says otherwise.
+# proxy's front address, then reset so it retries there. Selkies is
+# redirected (HTTP 307) unless HTTP_FOREIGN says otherwise. Traefik uses
+# Service/${PROXY_NAME}, which is the back network, not the front IP.
 #
 # On start the container compiles gs-relay (UDP and RTSP) before Python
 # listens. startupProbe covers that first release build. Apply with:
@@ -45,11 +53,14 @@ spec:
     metadata:
       labels:
         app: ${PROXY_NAME}
+      annotations:
+        ovn.kubernetes.io/logical_switch: ${OVN_BACK_SUBNET}
+        ovn.kubernetes.io/default_route: "true"
+        k8s.v1.cni.cncf.io/networks: ${OVN_FRONT_NAD_NS}/${OVN_FRONT_NETWORK}
+        ${OVN_FRONT_NETWORK}.${OVN_FRONT_NAD_NS}.ovn.kubernetes.io/logical_switch: ${OVN_FRONT_NETWORK}
     spec:
       serviceAccountName: ${PROXY_NAME}
       automountServiceAccountToken: false
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
       nodeSelector:
         # gpu.present is the GPU Operator. The kata label is the gate in
         # docs/nvkvm-kata.md. Seats are pinned with nodeName, which does not
@@ -64,7 +75,6 @@ spec:
           ports:
             - name: http
               containerPort: ${HTTP_PORT}
-              hostPort: ${HTTP_PORT}
           envFrom:
             - configMapRef:
                 name: gs-config

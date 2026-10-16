@@ -112,6 +112,15 @@ def main(argv):
     if "--self-test" in argv:
         values = derive(load_config(HERE / "gs-config.yaml"))
         assert values["SEAT_PROBE_FAILURES"] == "450", values["SEAT_PROBE_FAILURES"]
+        proxy = fill((HERE / "proxy.yaml").read_text(), values, HERE / "proxy.yaml")
+        assert "hostNetwork:" not in proxy
+        assert "hostPort:" not in proxy
+        assert "k8s.v1.cni.cncf.io/networks: default/cs1-resident" in proxy
+        assert "ovn.kubernetes.io/logical_switch: ovn-default" in proxy
+        assert "cs1-resident.default.ovn.kubernetes.io/logical_switch: cs1-resident" in proxy
+        seat = fill((HERE / "seat-direct.yaml").read_text(), values, HERE / "seat-direct.yaml")
+        assert "ovn.kubernetes.io/logical_switch: ovn-default" in seat
+        assert "cs1-resident" not in seat
         sample = (HERE / "orchestrator.yaml").read_text()
         assert placeholder_lines(sample), "sample manifest has no CHANGE_ME secrets"
         assert not placeholder_lines("# CHANGE_ME in a comment\nkey: value\n")
