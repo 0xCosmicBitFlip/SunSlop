@@ -355,7 +355,41 @@ def start_tpu(state, run_dir):
     return ""
 
 
+def graphics_boot(argv, env):
+    """nvkvm-steam uses the virtio-nvgpu DRM node as the display.
+
+    An emulated VGA or a second virtio-gpu takes /dev/dri/card0, and labwc
+    then never binds the NVIDIA device. GS_QEMU_VGA=keep leaves the argv alone.
+    """
+    mode = env.get("GS_QEMU_VGA", "none")
+    if mode == "keep":
+        return list(argv)
+    drop = ("virtio-gpu", "virtio-vga", "VGA", "qxl", "bochs-display", "ramfb")
+    out = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "-vga" and index + 1 < len(argv):
+            index += 2
+            continue
+        if arg == "-device" and index + 1 < len(argv):
+            device = argv[index + 1]
+            if any(token in device for token in drop) and "nvgpu" not in device:
+                index += 2
+                continue
+        out.append(arg)
+        index += 1
+    out.extend(["-vga", mode])
+    return out
+
+
+def sb_required(uefi, env):
+    """GS_SB_ENFORCE=1 refuses the unsigned direct-kernel fallback."""
+    return env.get("GS_SB_ENFORCE", "") == "1" and not uefi
+
+
 def launch(argv):
+    argv = graphics_boot(argv, os.environ)
     me = os.path.realpath(sys.argv[0])
     shim = os.environ.get("NVKVM_SHIM", "/opt/nvkvm-kata/bin/nvkvm-qemu-shim")
     if shim and os.path.realpath(shim) != me and os.access(shim, os.X_OK):
@@ -402,6 +436,12 @@ def main(argv):
             sys.stderr.write("gs-kata-shim: tpu %s\n" % tpu)
         else:
             sys.stderr.write("gs-kata-shim: tpu did not listen, seat has no TPU\n")
+    if sb_required(uefi, env):
+        sys.stderr.write(
+            "gs-kata-shim: GS_SB_ENFORCE=1 but the signed variable store is not in use. "
+            "Refusing to boot an unsigned kernel.\n"
+        )
+        return 1
     if uefi:
         sys.stderr.write("gs-kata-shim: secure boot vars %s\n" % uefi)
     launch(rewritten)
@@ -514,6 +554,17 @@ def _self_test():
     devices = tpu_devices(sock)
     assert "reconnect-ms=200" in devices[1]
     assert TPU_NAME in devices[-1]
+    cleaned = graphics_boot(
+        ["-vga", "std", "-device", "virtio-gpu-pci", "-device", "virtio-nvgpu-pci,id=nvkvm0", "-kernel", "vmlinuz"],
+        {},
+    )
+    assert cleaned[0] == "-device" and "nvgpu" in cleaned[1]
+    assert "-vga" in cleaned and cleaned[-1] == "none"
+    assert "virtio-gpu-pci" not in cleaned
+    assert graphics_boot(["-vga", "std"], {"GS_QEMU_VGA": "keep"}) == ["-vga", "std"]
+    assert sb_required("", {"GS_SB_ENFORCE": "1"}) is True
+    assert sb_required("/vars", {"GS_SB_ENFORCE": "1"}) is False
+    assert sb_required("", {}) is False
     print("self-test ok")
 
 

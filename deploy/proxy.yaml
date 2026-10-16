@@ -1,7 +1,9 @@
-# One proxy per GPU node. hostNetwork publishes HTTP_PORT and the Sunshine
-# family on the node. Do not request nvidia.com/gpu: that would consume a seat.
-# nvidia.com/gpu.present only selects the nodes. This pod has no kube token.
-# It asks Service/${ORCH_NAME} to create seats.
+# One proxy per GPU node. Same image as the orchestrator. GS_ROLE=proxy
+# compiles gs-relay, then starts moonlight_proxy.py. hostNetwork publishes
+# HTTP_PORT and the Sunshine family on the node. Do not request
+# nvidia.com/gpu: that would consume a seat. nvidia.com/gpu.present only
+# selects the nodes. This pod has no kube token. It asks Service/${ORCH_NAME}
+# to create seats.
 #
 # Moonlight that lands here while the seat is on another node is told that
 # node's address, then reset so it retries there. Selkies is redirected

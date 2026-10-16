@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Moonlight-facing proxy.
+"""Moonlight and Selkies proxy.
 
-Clients pair with this process, not with a seat. Moonlight's four pairing
-phases are plain HTTP on the configured Sunshine base. The follow-up
-pairchallenge, and every later control call, is TLS on the HTTPS port. The
-client certificate selects a login. If the seat is down the request is held
-until it is up, then a second TLS session to the pod presents the shared
-proxy certificate.
+This is the process the image starts when GS_ROLE=proxy. The orchestrator
+is the other process in the same image (GS_ROLE=orchestrator). Pairing,
+TLS, the Selkies reverse proxy, and /admin stay in the gs package. This
+file only loads them.
 
-The pieces live next to this file: gs.protocol (codec), gs.pairing (the four
-phases), gs.store (the shared certificate), gs.relay (UDP/RTSP control), and
-gs.moonlight (TLS, the HTTP port, and /admin).
+With no GS_ROLE, or with --self-test, this runs the Moonlight self-test
+instead of listening. That is how `python3 orchestrator/moonlight_proxy.py`
+is invoked from a checkout.
 """
+
+import os
+import sys
 
 from gs.moonlight import MoonlightProxy
 from gs.store import Store
@@ -22,5 +23,35 @@ def self_test():
     run()
 
 
+def serve():
+    from gs.api import publish_proxy_cert
+    from gs.browser import App
+    from gs.config import load_config, require_persist_mount
+    from gs.model import Directory, reserved_names
+    from gs.seats import RemoteSeats
+
+    cfg = load_config()
+    if cfg.role != "proxy":
+        raise SystemExit(f"moonlight_proxy serves GS_ROLE=proxy, not {cfg.role}")
+    require_persist_mount(cfg.persist_mount)
+    directory = Directory(
+        cfg.users_file, reserved_names(cfg.common_dir, cfg.layer_dir, cfg.proxy_dir)
+    )
+    publish_proxy_cert(cfg)
+    App(cfg, directory, RemoteSeats(cfg)).serve()
+
+
+def main():
+    role = os.environ.get("GS_ROLE", "").strip().lower()
+    if "--self-test" in sys.argv or role != "proxy":
+        self_test()
+        return 0
+    serve()
+    return 0
+
+
 if __name__ == "__main__":
-    self_test()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)

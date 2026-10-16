@@ -60,6 +60,18 @@ The second command fails until every `CHANGE_ME` value is gone.
 
 On every CentOS Stream 9 (or other RHEL-family) GPU worker, as root. The full host checks, the containerd snippets, and what not to change in the GPU Operator are in [nvkvm-kata.md](nvkvm-kata.md).
 
+Skip this next block for a first bring-up. Secure Boot stays capable and off, and the unsigned kernel boots. If this site will boot the guest with Secure Boot on, generate the key first. The install below compiles the kernel, and the kernel has to trust the cert.
+
+```bash
+dnf install -y python3-virt-firmware sbsigntools openssl
+install -d -m 0700 /etc/nvkvm-kata
+bash /path/to/SunSlop/deploy/kata/secureboot.sh --init --dir /etc/nvkvm-kata/secureboot
+bash /path/to/SunSlop/deploy/kata/secureboot.sh --fragment --dir /etc/nvkvm-kata/secureboot \
+  > /etc/nvkvm-kata/secureboot/module-sig.conf
+```
+
+`module-sig.conf` is not spliced by `apply-desktop-kernel.sh`. After the clone below, append that file to `kata/fragments/gpu/nvkvm.x86_64.conf.in` before `nvkvm-kata-install.sh`, or the guest will not trust modules signed by this key. Do not add `CONFIG_MODULE_SIG_FORCE` until `nvkvm-guest.ko` is signed (step 5). The key stays on the operator machine. It is not in git, and it is not copied into a seat.
+
 ```bash
 dnf install -y git
 dnf config-manager --set-enabled crb
@@ -75,7 +87,7 @@ sudo scripts/nvkvm-kata-install.sh \
 systemctl restart containerd
 ```
 
-`--graphics 1` is required. The desktop fragment does not turn `CONFIG_DRM` on by itself. After any GPU Operator upgrade, confirm the `nvkvm-kata` block is still in containerd's config and that `disabled_plugins` does not contain `cri`.
+`--graphics 1` is required. The desktop fragment does not turn `CONFIG_DRM` on by itself. The graphics fragment has to set `CONFIG_DRM`, `CONFIG_DRM_KMS_HELPER`, and `CONFIG_DRM_GEM_SHMEM_HELPER`. `apply-desktop-kernel.sh` checks that file. The shim passes `-vga none` so an emulated VGA does not take `/dev/dri/card0` from the virtio-nvgpu node. After any GPU Operator upgrade, confirm the `nvkvm-kata` block is still in containerd's config and that `disabled_plugins` does not contain `cri`.
 
 ## 5. GPU node: shim, OVMF, Kata config
 
@@ -106,9 +118,35 @@ GS_UEFI_TEMPLATE=/usr/share/edk2/ovmf/OVMF_VARS.fd
 NVKVM_SHIM=/opt/nvkvm-kata/bin/nvkvm-qemu-shim
 ```
 
-Use the empty `OVMF_VARS.fd`, not `OVMF_VARS.secboot.fd`. The secboot store enrolls keys and then will not boot this unsigned guest kernel. Secure Boot stays capable and off. Enrolling keys later is per login, at `<PERSIST_ROOT>/<login>/uefi/OVMF_VARS.fd`, and deleting that file returns the login to the empty template.
+Use the empty `OVMF_VARS.fd`, not `OVMF_VARS.secboot.fd`. The secboot store enrolls Microsoft's keys and then will not boot this unsigned guest kernel. With the empty store, Secure Boot stays capable and off. The per-login copy is `<PERSIST_ROOT>/<login>/uefi/OVMF_VARS.fd`. The shim copies the template only when that file is missing. Deleting it returns the login to whatever the template is now.
 
-`KATA_SECURE_BOOT=false` or `TPU_EMULATION=false` in the ConfigMap skips that half. The TPU is a 1 MiB scratchpad on a virtio serial port, not a Cloud TPU.
+`KATA_FIRMWARE_VARS` and `GS_UEFI_TEMPLATE` are the same path. The pod does not pass the template. Only `shim.env` does.
+
+To turn Secure Boot on, after the kernel from step 4 exists, sign it with the site key and enroll that key in custom mode. Custom mode means a PK is present, so the firmware is not in Setup Mode. The same cert is PK, KEK, and db. This replaces the empty template. Do it before the first seat if you do not want to delete variable stores later.
+
+```bash
+# vmlinuz and nvkvm-guest.ko are the paths the install just wrote.
+bash /path/to/SunSlop/deploy/kata/secureboot.sh --sign-kernel \
+  --dir /etc/nvkvm-kata/secureboot /path/vmlinuz
+bash /path/to/SunSlop/deploy/kata/secureboot.sh --sign-module \
+  --dir /etc/nvkvm-kata/secureboot \
+  --kbuild /path/kata-linux-nvkvm /path/nvkvm-guest.ko
+bash /path/to/SunSlop/deploy/kata/secureboot.sh --enroll \
+  --dir /etc/nvkvm-kata/secureboot \
+  --template /usr/share/edk2/ovmf/OVMF_VARS.fd \
+  --out /etc/nvkvm-kata/secureboot/OVMF_VARS.custom.fd
+```
+
+Point Kata's `kernel` at the signed EFI stub (`vmlinuz.signed`), not a raw bzImage. OVMF checks that `-kernel` image only when the variable store has Secure Boot on. Then change `shim.env`:
+
+```
+GS_UEFI_TEMPLATE=/etc/nvkvm-kata/secureboot/OVMF_VARS.custom.fd
+GS_SB_ENFORCE=1
+```
+
+Set `KATA_FIRMWARE_VARS` to that same path and re-render when you apply. `GS_SB_ENFORCE=1` makes the shim exit instead of dropping the pflash and booting unsigned. If any login already has `OVMF_VARS.fd`, delete it once. An old store still has Secure Boot off, and the shim will not overwrite it.
+
+`KATA_SECURE_BOOT=false` or `TPU_EMULATION=false` in the ConfigMap skips that half. The TPU is a 1 MiB scratchpad on a virtio serial port, not a Cloud TPU. The shim also passes `-vga none` unless `GS_QEMU_VGA=keep`. That is what keeps the nvkvm DRM node as `/dev/dri/card0`.
 
 ## 6. Prove the node
 
@@ -142,7 +180,7 @@ Repeat steps 4 through 7 for each GPU node. The proxy DaemonSet requires both `n
 
 ## 8. Images
 
-From the repo root, then on every node that needs the image. The seat image goes on every GPU node. The orchestrator image goes on the orchestrator's node and on every GPU node (the proxy is that image with `GS_ROLE=proxy`).
+From the repo root, then on every node that needs the image. The seat image goes on every GPU node. One control-plane image (`ORCH_IMAGE`) goes on the orchestrator's node and on every GPU node. The proxy DaemonSet uses that same image. `GS_ROLE=orchestrator` starts `orchestrator.py`. `GS_ROLE=proxy` compiles `gs-relay` and starts `moonlight_proxy.py`.
 
 ```bash
 docker build -f image/Dockerfile -t gamestream:local .
@@ -199,12 +237,14 @@ Do not publish 47990. That is Sunshine's own web UI, and only the seat listens.
 1. In Moonlight, add the address of any GPU node and start pairing. The PIN is on the client. The request waits up to 10 minutes.
 2. Open `http://<that-node>:8080/admin` (or the Traefik URL), enter `admin.password`, type the four digits, and pick the login.
 3. The certificate is stored at `<PERSIST_ROOT>/proxy/store.json`. The public half is `<PERSIST_ROOT>/proxy/proxy-client.crt`. Every seat mounts that file and trusts it at boot. `/admin` shows whether each login's state file contains it.
-4. Open the host in Moonlight. `applist` or launch is what creates the seat. A `serverinfo` poll does not. The first seat copies `/usr` into the shared layer, so the first connection can take most of `READY_TIMEOUT` (900 seconds). The pod is Ready when labwc's socket exists.
+4. Open the host in Moonlight. `applist` or launch is what creates the seat. A `serverinfo` poll does not. The seat's init container is the only writer of the shared package layer. The first one copies `/usr`, `/etc`, and `/opt` and may install RPMs, so the first connection can take most of `READY_TIMEOUT` (900 seconds). The desktop container then mounts `/usr` and `/opt` read-only and a private `/etc`. It has no `CAP_SYS_ADMIN`, so root in the seat cannot remount the layer or change `/games`. The pod is Ready when labwc's socket exists.
 5. An open Moonlight window keeps that seat up: the HTTPS `serverinfo` poll resets the idle timer. Closing Moonlight, with no browser session and no UDP, deletes the pod after `IDLE_SECONDS`. The home directory remains.
 
 ## 12. After it is up
 
 - A second node is steps 4 through 7, the same images, and the same disk. Re-apply only if a manifest changed.
 - An NVIDIA driver upgrade needs `nvkvm-kata-gpu-cdi discover --force` from the nvkvm-kata checkout, then the gate again. Do not trust a label left over from the previous driver.
-- Deleting a seat pod is not a pause. The game process is gone. Files under the home directory are not.
+- Deleting a seat pod is not a pause. The game process is gone. Files under the home directory are not. The shared layer is not. A seat cannot edit either of the other two: `/usr` and `/opt` are read-only, `/games` is read-only, and the layer directory is not mounted in the desktop container. Writable paths are the login's home and the tmpfs mounts `/tmp`, `/var/tmp`, `/var/log`, `/var/cache`, and `/run`.
+- Package changes go in `<PERSIST_ROOT>/<LAYER_DIR>/packages.list`, or in the image's `image/packages.list`. The next new seat's init container applies them. A running seat does not.
+- The desktop container's extra capabilities are `SYS_NICE`, `IPC_LOCK`, and `SYS_RESOURCE`. Those raise rtprio, memlock, and nofile for the session. The game process does not hold them. `SYS_ADMIN` is only on the init container.
 - The orchestrator can `get`, `list`, `watch`, `create`, `delete`, and `patch` pods in this namespace, and read pod logs. The proxy has no kube token.

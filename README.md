@@ -12,7 +12,7 @@ Kubernetes object names stay `gs-orchestrator`, `gs-proxy`, and `gamestream` unl
 
 - Kubernetes workers that have already passed [docs/nvkvm-kata.md](docs/nvkvm-kata.md). Do not apply a seat until that gate prints `GATE_OK` and the node is labeled `nvkvm.kata/ready=true`. The proxy DaemonSet requires that label as well as `nvidia.com/gpu.present=true`. Seats are pinned with `nodeName`, which does not re-check the RuntimeClass selector, so an unlabeled node must not be running a proxy.
 - A filesystem mounted at the same `PERSIST_ROOT` on every proxy node and on the orchestrator node.
-- The seat image imported on every GPU node, and the orchestrator image on the orchestrator node and every proxy node. Both processes are that one image, selected with `GS_ROLE`.
+- The seat image imported on every GPU node, and one control-plane image (`ORCH_IMAGE`) on the orchestrator node and every proxy node. The orchestrator Deployment and the proxy DaemonSet use that same image. `GS_ROLE` on the pod is what the entrypoint runs: `orchestrator` starts `orchestrator.py`, `proxy` compiles `gs-relay` and starts `moonlight_proxy.py`.
 - Traefik, or anything else that can route HTTP to Service `gs-proxy`. Moonlight does not go through that HTTP route. It dials the Sunshine ports on the proxy nodes.
 
 ## What listens where
@@ -104,7 +104,7 @@ docker build -f orchestrator/Dockerfile -t gs-orchestrator:local .
 docker save gamestream:local gs-orchestrator:local | sudo ctr -n k8s.io images import -
 ```
 
-Import the seat image on every GPU node. The orchestrator image has to be on the orchestrator's node and on every proxy node. It needs `python3-cryptography`, plus `rust`, `cargo`, and `gcc`. The proxy role compiles `gs-relay` from `/usr/local/src/gs-relay` on start and installs `/usr/local/bin/gs-relay`. The orchestrator role skips that. The first start is a release build; the proxy `startupProbe` allows five minutes. A later start of the same container filesystem skips the compile when the source stamp matches. `CERT_PROXY=false` does not use the relay. That mode still forwards the whole port span in Python.
+Import the seat image on every GPU node. Import `ORCH_IMAGE` (`gs-orchestrator:local` unless you changed it) on the orchestrator's node and on every proxy node. It is one image. It needs `python3-cryptography`, plus `rust`, `cargo`, and `gcc`. The container entrypoint reads `GS_ROLE`. `orchestrator` skips the relay and runs `orchestrator.py`. `proxy` compiles `gs-relay` from `/usr/local/src/gs-relay`, installs `/usr/local/bin/gs-relay`, and runs `moonlight_proxy.py`. The first proxy start is a release build; the proxy `startupProbe` allows five minutes. A later start of the same container filesystem skips the compile when the source stamp matches. `CERT_PROXY=false` does not use the relay. That mode still forwards the whole port span in Python.
 
 ## Apply
 
@@ -120,7 +120,7 @@ kubectl -n "$NS" rollout status ds/gs-proxy
 
 Point Traefik at Service `gs-proxy`, not at the orchestrator. The orchestrator Service is how the proxies reach `POST /v1/ensure`.
 
-Homes land on `<PERSIST_ROOT>/<login>`. The shared directory is `<PERSIST_ROOT>/<COMMON_DIR>`, mounted at `COMMON_MOUNT` in the seat (`/games`). The package layer is `<PERSIST_ROOT>/<LAYER_DIR>`, mounted at `LAYER_MOUNT` (`/gs-layer`). The proxy store is `<PERSIST_ROOT>/<PROXY_DIR>`. Both the proxy and the orchestrator mount `PERSIST_ROOT` at `PERSIST_MOUNT`. `COMMON_DIR`, `LAYER_DIR`, and `PROXY_DIR` are not legal logins. The desktop user inside the seat is `SEAT_USER` (`gsuser`, uid `SEAT_UID`), which is not a login name. The image's build-time account is overwritten from those values at boot. Rebuild the seat image only if you change packages in the Dockerfile, not if you rename the account.
+Homes land on `<PERSIST_ROOT>/<login>`. The shared directory is `<PERSIST_ROOT>/<COMMON_DIR>`, mounted read-only at `COMMON_MOUNT` in the seat (`/games`). The package layer is `<PERSIST_ROOT>/<LAYER_DIR>`. The init container mounts that directory at `LAYER_MOUNT` (`/gs-layer`) and is the only writer. The desktop mounts `usr` and `opt` from it read-only and does not see the layer directory. The proxy store is `<PERSIST_ROOT>/<PROXY_DIR>`. Both the proxy and the orchestrator mount `PERSIST_ROOT` at `PERSIST_MOUNT`. `COMMON_DIR`, `LAYER_DIR`, and `PROXY_DIR` are not legal logins. The desktop user inside the seat is `SEAT_USER` (`gsuser`, uid `SEAT_UID`), which is not a login name. The image's build-time account is overwritten from those values at boot, in the pod's private `/etc` only. Rebuild the seat image only if you change packages in the Dockerfile, not if you rename the account.
 
 ```bash
 python3 deploy/render.py --time-slicing | kubectl apply -f -
@@ -155,7 +155,7 @@ A later pause belongs behind `Seats.reap`. Do not widen the Role to get there.
 
 Seats ask the nvkvm VM for a Secure Boot capable firmware and a TPU emulator. The host side is [deploy/kata/gs_kata_shim.py](deploy/kata/gs_kata_shim.py), installed in front of the nvkvm QEMU shim. [docs/nvkvm-kata.md](docs/nvkvm-kata.md) is the node setup: `edk2-ovmf`, `enable_annotations`, and three lines in `shim.env`.
 
-`KATA_FIRMWARE` is `OVMF_CODE.secboot.fd`. The variable store starts as the empty `KATA_FIRMWARE_VARS` and is then `<PERSIST_ROOT>/<login>/uefi/OVMF_VARS.fd`. Secure Boot is supported and off, so the unsigned guest kernel still boots. Enrolling keys persists across pod delete and will then refuse that kernel. `KATA_SECURE_BOOT=false` skips it.
+`KATA_FIRMWARE` is `OVMF_CODE.secboot.fd`. The variable store starts as `KATA_FIRMWARE_VARS` and is then `<PERSIST_ROOT>/<login>/uefi/OVMF_VARS.fd`. Out of the box that template is the empty store, so the firmware is Secure Boot capable and Secure Boot is off. An unsigned kernel still boots. To turn Secure Boot on, [deploy/kata/secureboot.sh](deploy/kata/secureboot.sh) makes a unique self-signed site cert, enrolls it as PK, KEK, and db (custom mode, not Setup Mode), and signs the EFI stub kernel and `nvkvm-guest.ko`. Point `GS_UEFI_TEMPLATE` at the enrolled store and set `GS_SB_ENFORCE=1`. The shim then refuses to fall back to an unsigned direct-kernel boot. Delete each login's existing `OVMF_VARS.fd` once, or the old store (Secure Boot off) is kept. `KATA_SECURE_BOOT=false` skips the firmware path.
 
 The TPU is not a Cloud TPU. It is a 1 MiB int8 scratchpad at `/dev/virtio-ports/org.sunslop.tpu`. Its state file is `<PERSIST_ROOT>/<login>/tpu/state.bin` (`TPU_STATE_DIR`), on the same disk as the home directory, and it survives the pod. `TPU_EMULATION=false` skips it. The protocol is in the runtime doc.
 
@@ -171,23 +171,32 @@ That splices [deploy/kata/desktop.x86_64.conf](deploy/kata/desktop.x86_64.conf) 
 
 The fragment asks for uinput (and `INPUT_MISC`, which hides it), evdev, joydev, HID/UHID, ntsync, FUSE passthrough, overlay, squashfs (xz and zstd, multi decompressor), binfmt_misc, userfaultfd, 32-bit emulation, a dummy ALSA card plus the sequencer, EFI variables, transparent hugepages, schedutil uclamp, preempt, and a 1 kHz tick. FUSE and overlay are already in Kata's own fs fragment; they are repeated so this build still requests them. `CONFIG_DRM` stays in nvkvm's graphics fragment. Do not set `CONFIG_MODULE_SIG_FORCE`. That would refuse `nvkvm-guest.ko`. `memfd_create` is not a fragment line: its prompt exists only with `CONFIG_EXPERT`, and turning that on would drop the syscalls Kata does not name. The apply script gives the symbol `default y` and regenerates the config with `olddefconfig` before the kernel compiles.
 
-The node gate fails until `/proc/misc` has `uinput` and `ntsync`, `/proc/filesystems` has squashfs, overlay, and fuse, and `/proc/asound/cards` has the dummy card. uinput is a misc device (major 10). It is not a line in `/proc/devices`. The seat entrypoint bind-mounts `/dev/ntsync`, `/dev/fuse`, `/dev/uhid`, `/dev/snd`, and `/dev/uinput` from a devtmpfs when the container `/dev` does not already have them, creates any that are still missing from `/proc/misc`, chmod's the sound nodes (there is no udev), raises `vm.max_map_count` and the inotify watches, and adds the desktop user to the `audio` group. A pod that is already running does not pick this up. The GPU node has to rebuild the guest kernel. The first seat boot copies `/usr` into the shared layer, so `READY_TIMEOUT` is 900 seconds.
+The node gate fails until `/proc/misc` has `uinput` and `ntsync`, `/proc/filesystems` has squashfs, overlay, and fuse, and `/proc/asound/cards` has the dummy card. uinput is a misc device (major 10). It is not a line in `/proc/devices`. The desktop container creates `/dev/ntsync`, `/dev/fuse`, `/dev/uhid`, and `/dev/uinput` with `mknod` (major 10) when the runtime `/dev` does not already have them. It does not mount a devtmpfs: that would need `CAP_SYS_ADMIN`. The shim strips an emulated VGA (`-vga none`, unless `GS_QEMU_VGA=keep`) so `/dev/dri/card0` is nvkvm's DRM node, which is what a Steam guest uses. `--graphics 1` merges `CONFIG_DRM`, `CONFIG_DRM_KMS_HELPER`, and `CONFIG_DRM_GEM_SHMEM_HELPER`. The desktop user is in the `audio` group. A pod that is already running does not pick a kernel change up. The GPU node has to rebuild the guest kernel. The first seat's init container copies `/usr`, `/etc`, and `/opt` into the shared layer, so `READY_TIMEOUT` is 900 seconds.
 
 ## Package layer
 
 Startup packages are shared. They are not installed into each home, and they are not reinstalled on every boot.
 
-The seat image stays the base desktop. On start, as root, before supervisord, the entrypoint bind-mounts `<LAYER_MOUNT>/usr` and `<LAYER_MOUNT>/etc` over `/usr` and `/etc`. The dnf cache and `installed.list` sit beside them. The default mount is `/gs-layer`.
+The seat image stays the base desktop. An init container, `layer-init`, is the only writer. It flock-seeds `/usr`, `/etc`, and `/opt` into `<LAYER_MOUNT>` when the image changes, runs dnf, then copies `/etc` into an emptyDir private to this pod. That copy gets this pod's `resolv.conf`, `hosts`, `hostname`, and a new `machine-id`. The shared `/etc` is not mounted in the desktop container. The desktop mounts `usr` and `opt` from the layer **read-only**, and it does not mount the layer directory itself.
 
-`<PERSIST_ROOT>/<LAYER_DIR>` is its own directory on the persistent disk, not a folder inside `COMMON_MOUNT`. The first seat to see a new image copies `/usr` and `/etc` into that tree and runs dnf. Later seats take the flock, see the same image id and the same package list, and only bind-mount. That is a few seconds. Sixteen seats share one copy.
+`<PERSIST_ROOT>/<LAYER_DIR>` is its own directory on the persistent disk, not a folder inside `COMMON_MOUNT`. The first seat to see a new image does the copy. Later seats take the flock, see the same image id and the same package list, and only publish the private `/etc`. Sixteen seats share one `/usr`.
 
-The list is `/etc/gamestream/packages.list` in the image. If `<LAYER_MOUNT>/packages.list` exists, it replaces that list. One name per line. A package that is already in the rpmdb is skipped. A package this layer installed earlier and that is no longer on the list is `dnf remove`d. Nothing runs `dnf update`. `steam` enables RPM Fusion nonfree when it is missing.
+The list is `/etc/gamestream/packages.list` in the image. If `<LAYER_MOUNT>/packages.list` exists, it replaces that list. One name per line. A package that is already in the rpmdb is skipped. A package this layer installed earlier and that is no longer on the list is `dnf remove`d. Nothing runs `dnf update`. `steam` enables RPM Fusion nonfree when it is missing. Steam itself stays commented out.
 
-This is a real directory, not an overlay. The CRI-O root is often a network filesystem via FUSE, and the guest sees it through virtio-fs. Kernel overlay will not use either as an upper directory, and a shared overlay upper cannot be mounted by every seat at once. A bind mount is just files. POSIX `flock` on that filesystem is the lock around seed and dnf. `/etc/resolv.conf`, `hosts`, `hostname`, and `machine-id` are bind-mounted back from the pod so one seat's DNS is not written into the shared `/etc`.
+What is shared, and what is this pod's:
 
-`<SEAT_HOME>/packages.list` is ignored. Personal apps go in the home directory (a user prefix, a wine or lutris prefix, a binary under `~/bin`). They are not root RPMs on the shared layer. Do not delete `<PERSIST_ROOT>/<LAYER_DIR>`.
+| Path | Who can write | Why |
+|---|---|---|
+| `/usr`, `/opt` | init container only | RPMs. The desktop mount is read-only, and the desktop has no `CAP_SYS_ADMIN`, so root cannot remount it. |
+| `/etc` in the layer | init container only | Package config. Not mounted in the desktop. |
+| `/etc` in the pod | this desktop | Private copy: DNS, hostname, machine-id, the unix account. Discarded with the pod. |
+| `<SEAT_HOME>` | this login | Steam, Proton prefixes, Sunshine state, shader cache. One seat per login. |
+| `COMMON_MOUNT` (`/games`) | nobody in the pod | Shared library, read-only. A seat cannot replace a binary another seat runs. Stage files on the host. Per-user installs go in the home. |
+| `/tmp`, `/var/tmp`, `/var/log`, `/var/cache`, `/run` | this desktop | tmpfs, capped. Wayland, PipeWire, and supervisord live on `/run`. |
 
-The seat still needs `CAP_SYS_ADMIN` for the bind mounts. `LAYER_MOUNT` has to be a mount. `GS_LAYER_ALLOW_UNMOUNTED=1` is only for a local run without that volume.
+`<SEAT_HOME>/packages.list` is ignored. Do not delete `<PERSIST_ROOT>/<LAYER_DIR>`.
+
+The desktop container is `readOnlyRootFilesystem`. Its added capabilities are `SYS_NICE`, `IPC_LOCK`, and `SYS_RESOURCE`, so the entrypoint can raise rtprio, memlock, and nofile before it drops to the desktop user. The game process does not get those capabilities. `allowPrivilegeEscalation` is false, so a setuid `bwrap` will not gain root; Steam Linux Runtime uses a user namespace instead (`CONFIG_USER_NS`). `GS_LAYER_ALLOW_UNMOUNTED=1` is only for a local `docker run` without this pod spec. `LAYER_MOUNT` has to be a mount in the init container.
 
 ## ServiceAccount
 
@@ -211,6 +220,8 @@ python3 orchestrator/orchestrator.py --self-test
 python3 image/seat-boot.py --self-test
 python3 deploy/kata/gs_kata_shim.py --self-test
 bash deploy/kata/apply-desktop-kernel.sh --self-test
+bash deploy/kata/secureboot.sh --self-test
+bash image/layer-init.sh --self-test
 python3 deploy/render.py --self-test
 cargo test --offline --manifest-path orchestrator/gs-relay/Cargo.toml
 ```
@@ -219,8 +230,9 @@ cargo test --offline --manifest-path orchestrator/gs-relay/Cargo.toml
 
 | Path | Role |
 |---|---|
-| [orchestrator/orchestrator.py](orchestrator/orchestrator.py) | process entry: loads config, seats, Selkies, and the API |
-| [orchestrator/moonlight_proxy.py](orchestrator/moonlight_proxy.py) | process entry: `MoonlightProxy` and `Store` |
+| [orchestrator/orchestrator.py](orchestrator/orchestrator.py) | process the entrypoint starts when `GS_ROLE=orchestrator` |
+| [orchestrator/moonlight_proxy.py](orchestrator/moonlight_proxy.py) | process the entrypoint starts when `GS_ROLE=proxy` |
+| [orchestrator/entrypoint.sh](orchestrator/entrypoint.sh) | reads `GS_ROLE` and execs one of those two |
 | [orchestrator/gs/seats.py](orchestrator/gs/seats.py) | seat lifecycle: create, place, idle delete |
 | [orchestrator/gs/browser.py](orchestrator/gs/browser.py) | Selkies login and reverse proxy |
 | [orchestrator/gs/api.py](orchestrator/gs/api.py) | orchestrator HTTP API |
@@ -235,9 +247,11 @@ cargo test --offline --manifest-path orchestrator/gs-relay/Cargo.toml
 | [deploy/orchestrator.yaml](deploy/orchestrator.yaml) | Deployment, RBAC, users, cookie Secret |
 | [deploy/proxy.yaml](deploy/proxy.yaml) | DaemonSet, hostNetwork, no GPU request |
 | [image/](image) | seat image: labwc, Sunshine, Selkies, package layer, seat-boot |
+| [image/layer-init.sh](image/layer-init.sh) | init container: the only writer of the shared layer |
 | [deploy/seat-direct.yaml](deploy/seat-direct.yaml) | one pod, no orchestrator |
 | [deploy/time-slicing.yaml](deploy/time-slicing.yaml) | shares per GPU |
-| [deploy/kata/gs_kata_shim.py](deploy/kata/gs_kata_shim.py) | Secure Boot pflash and the TPU emulator, in front of the nvkvm QEMU shim |
+| [deploy/kata/gs_kata_shim.py](deploy/kata/gs_kata_shim.py) | Secure Boot pflash, `-vga none`, and the TPU emulator, in front of the nvkvm QEMU shim |
+| [deploy/kata/secureboot.sh](deploy/kata/secureboot.sh) | site key, custom-mode enroll, sign the kernel and `nvkvm-guest.ko` |
 | [deploy/kata/desktop.x86_64.conf](deploy/kata/desktop.x86_64.conf) | guest kernel fragment: uinput, ntsync, squashfs, 32-bit, dummy sound |
 | [docs/deploy.md](docs/deploy.md) | ordered install: disk, kata, gate, label, apply |
 | [docs/nvkvm-kata.md](docs/nvkvm-kata.md) | GPU-node runtime gate |

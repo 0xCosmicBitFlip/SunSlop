@@ -1,5 +1,7 @@
-# One orchestrator, anywhere. It creates seats. It does not listen for
-# Moonlight. The public listeners are the ${PROXY_NAME} DaemonSet in proxy.yaml.
+# One orchestrator, anywhere. Same image as the proxy DaemonSet. GS_ROLE
+# selects this process (orchestrator.py). It creates seats. It does not
+# listen for Moonlight. The public listeners are the ${PROXY_NAME} DaemonSet
+# in proxy.yaml.
 #
 # Site values come from deploy/gs-config.yaml. Apply with:
 #   python3 deploy/render.py | kubectl apply -f -

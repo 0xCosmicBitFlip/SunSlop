@@ -47,6 +47,7 @@ RUN groupadd -g 1000 gsuser \
 
 COPY image/ensure-packages.sh /usr/local/bin/ensure-packages.sh
 COPY image/entrypoint.sh /usr/local/bin/gamestream-entrypoint
+COPY image/layer-init.sh /usr/local/bin/layer-init
 COPY image/seat-boot.py /usr/local/bin/seat-boot.py
 COPY image/supervisord.conf /etc/gamestream/supervisord.conf.in
 COPY image/labwc-autostart /etc/gamestream/labwc-autostart
@@ -55,6 +56,7 @@ COPY image/packages.list /etc/gamestream/packages.list
 
 RUN chmod 0755 /usr/local/bin/ensure-packages.sh \
         /usr/local/bin/gamestream-entrypoint \
+        /usr/local/bin/layer-init \
         /usr/local/bin/seat-boot.py \
     && gst-inspect-1.0 nvh264enc >/dev/null \
     && command -v sunshine \

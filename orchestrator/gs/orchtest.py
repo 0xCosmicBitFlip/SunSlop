@@ -138,7 +138,28 @@ def self_test():
     assert env["GS_TPU_STATE"] == "/home/gsuser/tpu"
     assert env["GS_TPU_DEVICE"] == "/dev/virtio-ports/org.sunslop.tpu"
     assert pod["spec"]["volumes"][2]["hostPath"]["path"].endswith("/gs-layer")
-    probe = pod["spec"]["containers"][0]["readinessProbe"]["exec"]["command"][-1]
+    desktop = pod["spec"]["containers"][0]
+    sec = desktop["securityContext"]
+    assert sec["readOnlyRootFilesystem"] is True
+    assert "SYS_ADMIN" not in sec["capabilities"]["add"]
+    assert "SYS_NICE" in sec["capabilities"]["add"]
+    assert "IPC_LOCK" in sec["capabilities"]["add"]
+    assert "SYS_RESOURCE" in sec["capabilities"]["add"]
+    assert "SYS_ADMIN" in sec["capabilities"]["drop"]
+    init = pod["spec"]["initContainers"][0]
+    assert init["command"] == ["/usr/local/bin/layer-init"]
+    assert "SYS_ADMIN" in init["securityContext"]["capabilities"]["add"]
+    mounts = {item["mountPath"]: item for item in desktop["volumeMounts"]}
+    assert mounts["/usr"]["readOnly"] is True and mounts["/usr"]["subPath"] == "usr"
+    assert mounts["/opt"]["readOnly"] is True
+    assert mounts["/games"]["readOnly"] is True
+    assert mounts["/etc"]["subPath"] == "etc"
+    assert "/gs-layer" not in mounts
+    names = [item["name"] for item in desktop["volumeMounts"]]
+    assert "layer" not in [item["name"] for item in init["volumeMounts"] if item["mountPath"] == "/usr"]
+    assert init["volumeMounts"][0]["mountPath"] == "/gs-layer"
+    assert "tmp" in names and "run" in names
+    probe = desktop["readinessProbe"]["exec"]["command"][-1]
     assert probe == "test -S /run/user/1000/wayland-0"
     custom = Config(
         node="n1", namespace="ns", users_file="", secret=secret, cookie_ttl=10,

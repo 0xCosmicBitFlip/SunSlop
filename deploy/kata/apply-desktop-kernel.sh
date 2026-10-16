@@ -143,21 +143,31 @@ check_fragment() {
     need_symbol CONFIG_EFI "$file"
     need_symbol CONFIG_UCLAMP_TASK "$file"
     need_symbol CONFIG_TRANSPARENT_HUGEPAGE "$file"
+    need_symbol CONFIG_USER_NS "$file"
     need_symbol CONFIG_IKCONFIG_PROC "$file"
     forbid '^CONFIG_LOCALVERSION=' "$file" "desktop fragment must not set LOCALVERSION"
-    forbid 'CONFIG_MODULE_SIG_FORCE' "$file" "desktop fragment must not force module signatures"
+    forbid '^CONFIG_MODULE_SIG_FORCE=' "$file" "desktop fragment must not force module signatures"
     forbid '^CONFIG_.*=m$' "$file" "desktop fragment must be built-in (=y); the seat image has no modules tree"
     forbid '^CONFIG_HID_PID=' "$file" "HID_PID is not a 6.18 symbol and needs USB_HID"
     forbid '^CONFIG_SQUASHFS_DECOMP_MULTI=' "$file" "SQUASHFS_DECOMP_MULTI is hidden; set SQUASHFS_COMPILE_DECOMP_MULTI"
     forbid '^CONFIG_UDMABUF=' "$file" "UDMABUF depends on MEMFD_CREATE, which is not on during the fragment merge"
-    forbid '^CONFIG_DRM' "$file" "DRM stays in the graphics fragment"
+    forbid '^CONFIG_DRM' "$file" "DRM stays in the graphics fragment (nvkvm-graphics, --graphics 1)"
+}
+
+# nvkvm-steam's display is the graphics module's DRM node, not virtio-gpu.
+check_graphics() {
+    file=$1
+    [ -f "$file" ] || die "no $file. Steam needs nvkvm's graphics fragment (--graphics 1)."
+    need_symbol CONFIG_DRM "$file"
+    need_symbol CONFIG_DRM_KMS_HELPER "$file"
+    need_symbol CONFIG_DRM_GEM_SHMEM_HELPER "$file"
 }
 
 self_test() {
     check_fragment "$frag"
-    tmp=$(mktemp -d)
-    dest="$tmp/kata/fragments/gpu/nvkvm.x86_64.conf.in"
-    script="$tmp/scripts/build-guest-kernel.sh"
+    work=$(mktemp -d)
+    dest="$work/kata/fragments/gpu/nvkvm.x86_64.conf.in"
+    script="$work/scripts/build-guest-kernel.sh"
     mkdir -p "$(dirname "$dest")" "$(dirname "$script")"
     printf '%s\n' "CONFIG_MODULES=y" "CONFIG_FUSE_FS=y" > "$dest"
     cat > "$script" <<'EOF'
@@ -172,7 +182,10 @@ EOF
     [ "$count" = 1 ] || die "marker present $count times"
     need_symbol CONFIG_NTSYNC "$dest"
     need_symbol CONFIG_INPUT_UINPUT "$dest"
-    need_symbol CONFIG_INPUT_MISC "$dest"
+    need_symbol CONFIG_USER_NS "$dest"
+    gfx="$work/nvkvm-graphics.x86_64.conf"
+    printf '%s\n' "CONFIG_DRM=y" "CONFIG_DRM_KMS_HELPER=y" "CONFIG_DRM_GEM_SHMEM_HELPER=y" > "$gfx"
+    check_graphics "$gfx"
     head -n 1 "$dest" | grep -q '^CONFIG_MODULES=y$' || die "nvkvm prefix was eaten"
     mods=$(grep -c '^CONFIG_MODULES=y$' "$dest")
     [ "$mods" = 1 ] || die "CONFIG_MODULES duplicated"
@@ -187,8 +200,8 @@ EOF
     build_line=$(grep -n 'nvkvm "${VARGS\[@\]}" build' "$script" | head -n 1 | cut -d: -f1)
     [ "$mods_line" -lt "$hook_line" ] || die "hook landed above the MODULES anchor"
     [ "$hook_line" -lt "$build_line" ] || die "hook landed below the build"
-    kcfg="$tmp/mm/Kconfig"
-    mkdir -p "$tmp/mm"
+    kcfg="$work/mm/Kconfig"
+    mkdir -p "$work/mm"
     printf '%s\n' 'config MEMFD_CREATE' '	bool "Enable memfd_create() system call" if EXPERT' > "$kcfg"
     awk '
         $0 == "config MEMFD_CREATE" {
@@ -206,7 +219,7 @@ EOF
     if ! grep -q 'gs-desktop memfd default' "$kcfg"; then
         die "marker missing after one insertion"
     fi
-    rm -rf "$tmp"
+    rm -rf "$work"
     echo "self-test ok"
 }
 
@@ -221,6 +234,8 @@ dest="$root/kata/fragments/gpu/nvkvm.x86_64.conf.in"
 copy="$root/kata/fragments/gpu/desktop.x86_64.conf"
 script="$root/scripts/build-guest-kernel.sh"
 check_fragment "$frag"
+graphics="$root/kata/fragments/gpu/nvkvm-graphics.x86_64.conf"
+check_graphics "$graphics"
 splice_fragment "$frag" "$dest"
 mkdir -p "$(dirname "$copy")"
 cp "$frag" "$copy"
@@ -228,4 +243,4 @@ splice_hook "$script"
 echo "apply-desktop-kernel: spliced into $dest"
 echo "apply-desktop-kernel: copied to $copy (the build does not read this copy)"
 echo "apply-desktop-kernel: memfd_create default hooked in $script"
-echo "apply-desktop-kernel: rebuild with --graphics 1 so CONFIG_DRM is on. Kernel >= 6.14."
+echo "apply-desktop-kernel: rebuild with --graphics 1 so the nvkvm DRM node exists. Kernel >= 6.14. The shim forces -vga none."

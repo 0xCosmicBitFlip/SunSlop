@@ -192,9 +192,32 @@ GS_UEFI_TEMPLATE=/usr/share/edk2/ovmf/OVMF_VARS.fd
 NVKVM_SHIM=/opt/nvkvm-kata/bin/nvkvm-qemu-shim
 ```
 
-`GS_PERSIST_ROOT` is the same string as `PERSIST_ROOT`. `GS_UEFI_CODE` and `GS_UEFI_TEMPLATE` are the same strings as `KATA_FIRMWARE` and `KATA_FIRMWARE_VARS`. The template has to be the empty variable store. `OVMF_VARS.secboot.fd` already has keys enrolled, and this guest kernel is not signed, so the VM would not boot. With the empty store the firmware is Secure Boot capable and Secure Boot is off. Enrolling keys writes the per-login store; the next pod for that login keeps them, and then the unsigned kernel will not boot. That file is `<PERSIST_ROOT>/<login>/uefi/OVMF_VARS.fd`. Delete it to start from the template again.
+`GS_PERSIST_ROOT` is the same string as `PERSIST_ROOT`. `GS_UEFI_CODE` and `GS_UEFI_TEMPLATE` are the same strings as `KATA_FIRMWARE` and `KATA_FIRMWARE_VARS`. Until you enroll a site key, the template has to be the empty variable store. `OVMF_VARS.secboot.fd` already has Microsoft's keys, and this guest kernel is not signed by them, so the VM would not boot.
 
-The shim refuses any other path. A `..` component is rejected before it is normalized. If the firmware files are missing, or the variable store cannot be created, `-bios` is removed and the seat falls back to Kata's direct kernel boot instead of hanging on a half-configured OVMF. `KATA_SECURE_BOOT=false` does not ask.
+Secure Boot that actually verifies the kernel is a separate step, [deploy/kata/secureboot.sh](../deploy/kata/secureboot.sh). It generates one self-signed cert for this site (not a key that ships in the repo), enrolls that cert as PK, KEK, and db, and turns Secure Boot on. That is custom mode: a PK is present, so the firmware is not in Setup Mode. `virt-fw-vars` (Fedora package `python3-virt-firmware`) writes the store. `sbsign` signs the EFI stub kernel. `scripts/sign-file` from the built kernel tree signs `nvkvm-guest.ko` with the same key. `--fragment` prints the `CONFIG_SYSTEM_TRUSTED_KEYS` lines to build into the guest; do not add `CONFIG_MODULE_SIG_FORCE` until that module is signed, or the GPU device will not load.
+
+```bash
+install -d -m 0700 /etc/nvkvm-kata
+bash deploy/kata/secureboot.sh --init --dir /etc/nvkvm-kata/secureboot
+# rebuild the guest with the printed fragment, then:
+bash deploy/kata/secureboot.sh --sign-kernel --dir /etc/nvkvm-kata/secureboot /path/vmlinuz
+bash deploy/kata/secureboot.sh --sign-module --dir /etc/nvkvm-kata/secureboot \
+    --kbuild /path/kata-linux-nvkvm /path/nvkvm-guest.ko
+bash deploy/kata/secureboot.sh --enroll --dir /etc/nvkvm-kata/secureboot \
+    --template /usr/share/edk2/ovmf/OVMF_VARS.fd \
+    --out /etc/nvkvm-kata/secureboot/OVMF_VARS.custom.fd
+```
+
+Point Kata's `kernel` at the signed stub and set, in `/etc/nvkvm-kata/shim.env`:
+
+```
+GS_UEFI_TEMPLATE=/etc/nvkvm-kata/secureboot/OVMF_VARS.custom.fd
+GS_SB_ENFORCE=1
+```
+
+`GS_SB_ENFORCE=1` makes the shim exit instead of dropping the pflash and booting unsigned. OVMF checks the `-kernel` image when that store has Secure Boot on, so the file has to be the signed EFI stub (`CONFIG_EFI_STUB`), not a raw bzImage. Delete `<PERSIST_ROOT>/<login>/uefi/OVMF_VARS.fd` once after changing the template. The shim copies the template only when the login's store is missing, and it will not overwrite a store that already has keys. The shim also passes `-vga none` (set `GS_QEMU_VGA=keep` to stop that) so an emulated VGA does not take `/dev/dri/card0` from the virtio-nvgpu DRM node. That is the display nvkvm-steam uses. The guest still needs the host NVIDIA userspace, including the 32-bit `libGLX_nvidia` and `libcuda`, injected by the toolkit. A missing `libGLX_nvidia` is logged at seat start and does not by itself fail the pod.
+
+The shim refuses any other variable-store path. A `..` component is rejected before it is normalized. If the firmware files are missing and `GS_SB_ENFORCE` is not set, `-bios` is removed and the seat falls back to Kata's direct kernel boot instead of hanging on a half-configured OVMF. `KATA_SECURE_BOOT=false` does not ask.
 
 The TPU is a 1 MiB int8 scratchpad on a virtio serial port, not a Cloud TPU and not `libtpu`. QEMU has no TPU model, and neither does nvkvm. The device in the guest is `/dev/virtio-ports/org.sunslop.tpu` (`GS_TPU_DEVICE`). The scratchpad file is `<PERSIST_ROOT>/<login>/<TPU_STATE_DIR>/state.bin`, which the seat sees at `GS_TPU_STATE` because the home mount is that login's directory. The socket stays on the host under `/run/gs-tpu/`. Deleting the pod does not delete the file. `TPU_EMULATION=false` does not ask.
 

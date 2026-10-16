@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
-"""On-demand seats, split from the public proxy.
+"""On-demand seats.
 
-GS_ROLE=proxy is a DaemonSet on each GPU node (hostNetwork). It is the only
-thing listening for Moonlight and for the Selkies browser. It asks the
-orchestrator to create a seat and only splices when that seat is on this
-same node. A seat on another node is not spliced: Moonlight is given that
-node's address in serverinfo and then reset so its next poll lands there,
-and the browser is redirected. HTTP_FOREIGN=reset skips the hand-off.
+The image is shared with the proxy. The container entrypoint reads GS_ROLE
+and starts this file only for the orchestrator (and for GS_ROLE=all, a
+local process that is not what the manifests deploy).
 
-GS_ROLE=orchestrator is one pod with no GPU and no host network. It creates
-and deletes seats. The shared proxy certificate is generated on first start
-under the persist volume; every proxy uses it, and the seat boot script
-installs the public half into Sunshine.
+GS_ROLE=orchestrator creates and deletes seats. It does not listen for
+Moonlight. The shared proxy certificate is generated here on first start
+when no proxy has written it yet.
 
-GS_ROLE=all is the older single process, for a local run. The deploy does
-not use it.
+GS_ROLE=proxy is moonlight_proxy.py. Starting it from this file is refused
+so a pod cannot accidentally open the public ports and the API together.
+
+GS_ROLE=all is the older single process, for a local run.
 
 The implementation is the gs package next to this file: users and cookies
 in gs.model, seat pods in gs.seats, the browser proxy in gs.browser, and
@@ -28,7 +26,7 @@ from gs.browser import App
 from gs.config import load_config, require_persist_mount
 from gs.kube import Kube
 from gs.model import Directory, reserved_names
-from gs.seats import RemoteSeats, Seats
+from gs.seats import Seats
 
 
 def main():
@@ -37,12 +35,13 @@ def main():
         self_test()
         return 0
     cfg = load_config()
+    if cfg.role == "proxy":
+        raise SystemExit(
+            "GS_ROLE=proxy is /usr/local/bin/moonlight_proxy.py. "
+            "The image entrypoint starts that process."
+        )
     require_persist_mount(cfg.persist_mount)
     directory = Directory(cfg.users_file, reserved_names(cfg.common_dir, cfg.layer_dir, cfg.proxy_dir))
-    if cfg.role == "proxy":
-        publish_proxy_cert(cfg)
-        App(cfg, directory, RemoteSeats(cfg)).serve()
-        return 0
     publish_proxy_cert(cfg)
     kube = Kube(cfg.namespace, cfg.seat_label)
     cfg.namespace = kube.ns

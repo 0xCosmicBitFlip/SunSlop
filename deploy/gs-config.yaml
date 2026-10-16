@@ -50,11 +50,13 @@ data:
   SEAT_CPU_LIMIT: "8"
   SEAT_MEMORY_LIMIT: "16Gi"
   KATA_MEMORY_MIB: "16384"
-  # Secure Boot capable OVMF. The VARS template is the empty one. The
-  # secboot VARS image enrolls keys and then refuses this unsigned guest
-  # kernel. The shim copies the template to <PERSIST_ROOT>/<login>/uefi/
-  # once, and leaves an enrolled store alone. These two paths are also
-  # GS_UEFI_CODE and GS_UEFI_TEMPLATE in /etc/nvkvm-kata/shim.env.
+  # Secure Boot capable OVMF. Leave this as the empty OVMF_VARS.fd until
+  # deploy/kata/secureboot.sh --enroll has written a site store. The secboot
+  # VARS image enrolls Microsoft keys and then refuses this guest kernel.
+  # After enroll, set this to the same path as GS_UEFI_TEMPLATE
+  # (OVMF_VARS.custom.fd) and set GS_SB_ENFORCE=1 in shim.env. The shim
+  # copies the template to <PERSIST_ROOT>/<login>/uefi/ once, and leaves an
+  # enrolled store alone. Delete that file to pick up a new template.
   KATA_SECURE_BOOT: "true"
   KATA_FIRMWARE: "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd"
   KATA_FIRMWARE_VARS: "/usr/share/edk2/ovmf/OVMF_VARS.fd"

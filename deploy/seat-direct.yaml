@@ -20,6 +20,32 @@ spec:
   restartPolicy: Never
   runtimeClassName: ${RUNTIME_CLASS}
   terminationGracePeriodSeconds: 15
+  initContainers:
+    - name: layer
+      image: ${SEAT_IMAGE}
+      imagePullPolicy: IfNotPresent
+      command: ["/usr/local/bin/layer-init"]
+      env:
+        - name: GS_USER
+          value: ${SEAT_USER}
+        - name: GS_UID
+          value: "${SEAT_UID}"
+        - name: GS_GID
+          value: "${SEAT_GID}"
+        - name: GS_HOME
+          value: ${SEAT_HOME}
+        - name: GS_LAYER
+          value: ${LAYER_MOUNT}
+      securityContext:
+        runAsUser: 0
+        capabilities:
+          add: ["SYS_ADMIN"]
+          drop: ["SYS_MODULE", "SYS_PTRACE", "SYS_RAWIO", "NET_ADMIN"]
+      volumeMounts:
+        - name: layer
+          mountPath: ${LAYER_MOUNT}
+        - name: pod-etc
+          mountPath: /pod-etc
   containers:
     - name: desktop
       image: ${SEAT_IMAGE}
@@ -91,8 +117,11 @@ spec:
           value: /dev/virtio-ports/org.sunslop.tpu
       securityContext:
         runAsUser: 0
+        readOnlyRootFilesystem: true
+        allowPrivilegeEscalation: false
         capabilities:
-          add: ["SYS_ADMIN"]
+          add: ["SYS_NICE", "IPC_LOCK", "SYS_RESOURCE"]
+          drop: ["SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_RAWIO", "NET_ADMIN", "SYS_BOOT", "BPF"]
       readinessProbe:
         exec:
           command: ["/bin/bash", "-lc", "test -S ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"]
@@ -113,8 +142,28 @@ spec:
           mountPath: ${SEAT_HOME}
         - name: common
           mountPath: ${COMMON_MOUNT}
+          readOnly: true
+        - name: pod-etc
+          mountPath: /etc
+          subPath: etc
         - name: layer
-          mountPath: ${LAYER_MOUNT}
+          mountPath: /usr
+          subPath: usr
+          readOnly: true
+        - name: layer
+          mountPath: /opt
+          subPath: opt
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        - name: var-tmp
+          mountPath: /var/tmp
+        - name: var-log
+          mountPath: /var/log
+        - name: var-cache
+          mountPath: /var/cache
+        - name: run
+          mountPath: /run
         - name: proxy-cert
           mountPath: ${PROXY_CERT_MOUNT}
           readOnly: true
@@ -131,6 +180,28 @@ spec:
       hostPath:
         path: ${PERSIST_ROOT}/${LAYER_DIR}
         type: DirectoryOrCreate
+    - name: pod-etc
+      emptyDir: {}
+    - name: tmp
+      emptyDir:
+        medium: Memory
+        sizeLimit: 6Gi
+    - name: var-tmp
+      emptyDir:
+        medium: Memory
+        sizeLimit: 2Gi
+    - name: var-log
+      emptyDir:
+        medium: Memory
+        sizeLimit: 256Mi
+    - name: var-cache
+      emptyDir:
+        medium: Memory
+        sizeLimit: 1Gi
+    - name: run
+      emptyDir:
+        medium: Memory
+        sizeLimit: 1Gi
     - name: proxy-cert
       hostPath:
         path: ${PERSIST_ROOT}/${PROXY_DIR}/${PROXY_CLIENT_CERT}

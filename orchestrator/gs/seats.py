@@ -245,9 +245,9 @@ class Seats:
 def probe_failures(ready_timeout, period=2):
     """Kubelet checks for the labwc socket this many times.
 
-    period seconds times this count has to cover READY_TIMEOUT. A shorter
-    probe marks the seat NotReady while the first layer copy is still running,
-    and the orchestrator then reports that the pod never became ready.
+    The layer install is an init container, so this probe only covers the
+    desktop coming up after that. The orchestrator wait still has to cover
+    both, which is why READY_TIMEOUT stays at 900s.
     """
     ready = max(int(ready_timeout), period)
     return max(1, (ready + period - 1) // period)
@@ -327,14 +327,27 @@ def seat_pod(cfg, user, gpu, node=None):
         env.append({"name": "GS_TPU_DEVICE", "value": "/dev/virtio-ports/org.sunslop.tpu"})
     mounts = [
         {"name": "home", "mountPath": cfg.seat_home},
-        {"name": "common", "mountPath": cfg.common_mount},
-        {"name": "layer", "mountPath": cfg.layer_mount},
+        {"name": "common", "mountPath": cfg.common_mount, "readOnly": True},
+        {"name": "pod-etc", "mountPath": "/etc", "subPath": "etc"},
+        {"name": "layer", "mountPath": "/usr", "subPath": "usr", "readOnly": True},
+        {"name": "layer", "mountPath": "/opt", "subPath": "opt", "readOnly": True},
     ]
     volumes = [
         {"name": "home", "hostPath": {"path": home, "type": "DirectoryOrCreate"}},
         {"name": "common", "hostPath": {"path": cfg.common_host, "type": "DirectoryOrCreate"}},
         {"name": "layer", "hostPath": {"path": layer, "type": "DirectoryOrCreate"}},
+        {"name": "pod-etc", "emptyDir": {}},
     ]
+    # Memory-backed and private. Not the shared layer, and not another seat's home.
+    for name, path, size in (
+        ("tmp", "/tmp", "6Gi"),
+        ("var-tmp", "/var/tmp", "2Gi"),
+        ("var-log", "/var/log", "256Mi"),
+        ("var-cache", "/var/cache", "1Gi"),
+        ("run", "/run", "1Gi"),
+    ):
+        mounts.append({"name": name, "mountPath": path})
+        volumes.append({"name": name, "emptyDir": {"medium": "Memory", "sizeLimit": size}})
     if cfg.proxy_cert_host:
         mounts.append({
             "name": "proxy-cert",
@@ -345,6 +358,11 @@ def seat_pod(cfg, user, gpu, node=None):
             "name": "proxy-cert",
             "hostPath": {"path": cfg.proxy_cert_host, "type": "FileOrCreate"},
         })
+    desktop_mounts = list(mounts)
+    init_mounts = [
+        {"name": "layer", "mountPath": cfg.layer_mount},
+        {"name": "pod-etc", "mountPath": "/pod-etc"},
+    ]
     return {
         "apiVersion": "v1",
         "kind": "Pod",
@@ -363,6 +381,23 @@ def seat_pod(cfg, user, gpu, node=None):
             "runtimeClassName": cfg.runtime,
             "nodeName": node,
             "terminationGracePeriodSeconds": 15,
+            "initContainers": [
+                {
+                    "name": "layer",
+                    "image": cfg.image,
+                    "imagePullPolicy": "IfNotPresent",
+                    "command": ["/usr/local/bin/layer-init"],
+                    "env": env,
+                    "securityContext": {
+                        "runAsUser": 0,
+                        "capabilities": {
+                            "add": ["SYS_ADMIN"],
+                            "drop": ["SYS_MODULE", "SYS_PTRACE", "SYS_RAWIO", "NET_ADMIN"],
+                        },
+                    },
+                    "volumeMounts": init_mounts,
+                }
+            ],
             "containers": [
                 {
                     "name": "desktop",
@@ -371,7 +406,18 @@ def seat_pod(cfg, user, gpu, node=None):
                     "env": env,
                     "securityContext": {
                         "runAsUser": 0,
-                        "capabilities": {"add": ["SYS_ADMIN"]},
+                        "readOnlyRootFilesystem": True,
+                        "allowPrivilegeEscalation": False,
+                        "capabilities": {
+                            # SYS_NICE / IPC_LOCK / SYS_RESOURCE raise rlimits the
+                            # desktop user inherits. They are not given to the game.
+                            # SYS_ADMIN is absent so root cannot remount the layer rw.
+                            "add": ["SYS_NICE", "IPC_LOCK", "SYS_RESOURCE"],
+                            "drop": [
+                                "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_RAWIO",
+                                "NET_ADMIN", "SYS_BOOT", "BPF",
+                            ],
+                        },
                     },
                     "readinessProbe": {
                         "exec": {"command": ["/bin/bash", "-lc", f"test -S {wayland}"]},
@@ -380,7 +426,7 @@ def seat_pod(cfg, user, gpu, node=None):
                         "failureThreshold": probe_failures(cfg.ready_timeout),
                     },
                     "resources": {"requests": requests, "limits": limits},
-                    "volumeMounts": mounts,
+                    "volumeMounts": desktop_mounts,
                 }
             ],
             "volumes": volumes,

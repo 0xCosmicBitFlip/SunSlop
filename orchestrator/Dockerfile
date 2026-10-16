@@ -1,7 +1,9 @@
-# docker build -f orchestrator/Dockerfile -t gs-orchestrator:local .
-# Proxy pods compile gs-relay on start from the source copied here. The image
-# carries the compiler, not a prebuilt relay binary. GS_ROLE=orchestrator
-# skips that compile.
+# One control-plane image for the orchestrator Deployment and the proxy
+# DaemonSet. docker build -f orchestrator/Dockerfile -t gs-orchestrator:local .
+# The entrypoint reads GS_ROLE from the pod:
+#   orchestrator -> orchestrator.py (no relay compile)
+#   proxy        -> compile gs-relay, then moonlight_proxy.py
+# The image carries the compiler, not a prebuilt relay binary.
 FROM fedora:44
 RUN dnf -y install python3 python3-cryptography rust cargo gcc && dnf clean all
 COPY orchestrator/orchestrator.py /usr/local/bin/orchestrator.py
