@@ -46,6 +46,7 @@ class Config:
     memory_request: str = "8Gi"
     cpu_request: str = "2"
     kata_memory: str = "16384"
+    kata_max_memory: str = "24576"
     nvidia_caps: str = "compute,utility,graphics,display,video"
     selkies_encoder: str = "nvh264enc"
     persist_mount: str = "/var/lib/gs-persist"
@@ -228,6 +229,10 @@ def load_config():
     gamessd_mount = _safe(env_get("GAMESSD_MOUNT", "/gamessd"), "GAMESSD_MOUNT").rstrip("/")
     if games_mount == gamessd_mount:
         raise SystemExit("GAMES_MOUNT and GAMESSD_MOUNT are the same path")
+    kata_memory = env_get("KATA_MEMORY_MIB", "16384")
+    kata_max_memory = env_get("KATA_MAX_MEMORY_MIB", "24576")
+    if int(kata_max_memory) < int(kata_memory):
+        raise SystemExit("KATA_MAX_MEMORY_MIB is below KATA_MEMORY_MIB")
     return Config(
         node=os.environ["NODE_NAME"],
         namespace=os.environ.get("POD_NAMESPACE", ""),
@@ -249,7 +254,7 @@ def load_config():
         ready_timeout=env_int("READY_TIMEOUT", 900),
         device_plugin=env_get("DEVICE_PLUGIN", "true").lower() not in ("0", "false", "no"),
         http_foreign=env_get("HTTP_FOREIGN", "redirect"),
-        memory_limit=env_get("SEAT_MEMORY_LIMIT", "16Gi"),
+        memory_limit=env_get("SEAT_MEMORY_LIMIT", "26Gi"),
         cpu_limit=env_get("SEAT_CPU_LIMIT", "8"),
         cert_proxy=flag not in ("0", "false", "no"),
         proxy_store=proxy_store,
@@ -268,9 +273,10 @@ def load_config():
         xdg_runtime=xdg_runtime,
         wayland_display=wayland_display,
         sunshine_base=env_int("SUNSHINE_BASE", SUNSHINE_BASE),
-        memory_request=env_get("SEAT_MEMORY_REQUEST", "8Gi"),
+        memory_request=env_get("SEAT_MEMORY_REQUEST", "16Gi"),
         cpu_request=env_get("SEAT_CPU_REQUEST", "2"),
-        kata_memory=env_get("KATA_MEMORY_MIB", "16384"),
+        kata_memory=kata_memory,
+        kata_max_memory=kata_max_memory,
         nvidia_caps=env_get(
             "NVIDIA_DRIVER_CAPABILITIES", "compute,utility,graphics,display,video"
         ),

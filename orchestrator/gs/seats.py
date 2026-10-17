@@ -399,6 +399,8 @@ def kata_annotations(cfg, home, activity):
     ann = {
         "io.katacontainers.config.hypervisor.default_vcpus": cfg.cpu_limit,
         "io.katacontainers.config.hypervisor.default_memory": cfg.kata_memory,
+        "io.katacontainers.config.hypervisor.default_maxmemory": cfg.kata_max_memory,
+        "io.katacontainers.config.hypervisor.enable_virtio_mem": "true",
         ACTIVITY: activity,
     }
     home = home.rstrip("/")

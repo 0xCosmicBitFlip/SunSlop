@@ -126,6 +126,9 @@ def self_test():
     assert pod["metadata"]["labels"]["gamestream.local/gpu"] == "1"
     assert pod["metadata"]["annotations"][ACTIVITY].isdigit()
     ann = pod["metadata"]["annotations"]
+    assert ann["io.katacontainers.config.hypervisor.default_memory"] == "16384"
+    assert ann["io.katacontainers.config.hypervisor.default_maxmemory"] == "24576"
+    assert ann["io.katacontainers.config.hypervisor.enable_virtio_mem"] == "true"
     assert ann["io.katacontainers.config.hypervisor.firmware"].endswith("OVMF_CODE.secboot.fd")
     assert ann["ovn.kubernetes.io/logical_switch"] == "ovn-default"
     assert "cs1-resident" not in ann.values()

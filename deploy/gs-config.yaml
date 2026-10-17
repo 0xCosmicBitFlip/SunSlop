@@ -77,10 +77,17 @@ data:
   SESSIONS_PER_GPU: "8"
   DEVICE_PLUGIN: "true"
   SEAT_CPU_REQUEST: "2"
-  SEAT_MEMORY_REQUEST: "8Gi"
+  # Scheduler reservation. This is not the QEMU allocation.
+  SEAT_MEMORY_REQUEST: "16Gi"
   SEAT_CPU_LIMIT: "8"
-  SEAT_MEMORY_LIMIT: "16Gi"
+  # Cgroup cap for QEMU, virtiofsd, and the guest. The guest itself stops
+  # at KATA_MAX_MEMORY_MIB. The extra 2Gi is the VMM, not more guest RAM.
+  SEAT_MEMORY_LIMIT: "26Gi"
+  # Guest RAM at boot, in MiB. virtio-mem adds the rest up to the max
+  # only as the guest touches it. Ignored until configuration-nvkvm.toml
+  # lists default_memory, default_maxmemory, and enable_virtio_mem.
   KATA_MEMORY_MIB: "16384"
+  KATA_MAX_MEMORY_MIB: "24576"
   # Secure Boot capable OVMF. Leave this as the empty OVMF_VARS.fd until
   # deploy/kata/secureboot.sh --enroll has written a site store. The secboot
   # VARS image enrolls Microsoft keys and then refuses this guest kernel.

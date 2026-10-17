@@ -109,7 +109,7 @@ In `/etc/kata-containers/configuration-nvkvm.toml`:
 ```toml
 [hypervisor.qemu]
 path = "/usr/local/bin/gs-kata-shim"
-enable_annotations = ["default_vcpus", "default_memory", "firmware", "kernel_params"]
+enable_annotations = ["default_vcpus", "default_memory", "default_maxmemory", "enable_virtio_mem", "firmware", "kernel_params"]
 ```
 
 Keep any annotation name that was already listed. If `valid_hypervisor_paths` is non-empty, add `/usr/local/bin/gs-kata-shim` to it. `kernel_params` is trusted: a pod on this RuntimeClass can name a directory under either persist root. The orchestrator is the only thing that creates seat pods. Listing `firmware` without `kernel_params` leaves Kata on `-bios`, and the shim never sees the variable store.

@@ -15,6 +15,8 @@ metadata:
     ovn.kubernetes.io/logical_switch: ${OVN_BACK_SUBNET}
     io.katacontainers.config.hypervisor.default_vcpus: "${SEAT_CPU_LIMIT}"
     io.katacontainers.config.hypervisor.default_memory: "${KATA_MEMORY_MIB}"
+    io.katacontainers.config.hypervisor.default_maxmemory: "${KATA_MAX_MEMORY_MIB}"
+    io.katacontainers.config.hypervisor.enable_virtio_mem: "true"
     io.katacontainers.config.hypervisor.firmware: ${KATA_FIRMWARE}
     io.katacontainers.config.hypervisor.kernel_params: "sunslop.uefi_vars=${SEAT_HOME_HOST}/uefi/OVMF_VARS.fd sunslop.uefi_code=${KATA_FIRMWARE} sunslop.tpu_state=${SEAT_HOME_HOST}/${TPU_STATE_DIR}"
 spec:

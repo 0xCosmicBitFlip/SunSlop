@@ -173,13 +173,23 @@ install -m 0755 deploy/kata/gs_kata_shim.py /usr/local/bin/gs-kata-shim
 python3 /usr/local/bin/gs-kata-shim --self-test
 ```
 
-In `/etc/kata-containers/configuration-nvkvm.toml`, set `path` to the new shim and append the annotation names the seats use. `default_vcpus` and `default_memory` are already on the pod; they do nothing until they are listed here too.
+In `/etc/kata-containers/configuration-nvkvm.toml`, set `path` to the new shim and append the annotation names the seats use. `default_vcpus`, `default_memory`, `default_maxmemory`, and `enable_virtio_mem` are already on the pod; they do nothing until they are listed here too. Also set the four qemu keys below. `reclaim_guest_freed_memory` is not an annotation. It turns on free-page reporting on the balloon Kata already adds.
 
 ```toml
 [hypervisor.qemu]
 path = "/usr/local/bin/gs-kata-shim"
-enable_annotations = ["default_vcpus", "default_memory", "firmware", "kernel_params"]
+enable_annotations = ["default_vcpus", "default_memory", "default_maxmemory", "enable_virtio_mem", "firmware", "kernel_params"]
+# Boot at KATA_MEMORY_MIB. virtio-mem may grow the guest to KATA_MAX_MEMORY_MIB.
+# The memory backend is the boot size, not the max, so 24576 is not reserved.
+# Leave prealloc and hugepages off or that stops being true.
+enable_mem_prealloc = false
+enable_hugepages = false
+enable_virtio_mem = true
+memory_slots = 8
+reclaim_guest_freed_memory = true
 ```
+
+The seat boots at `KATA_MEMORY_MIB` (16384 MiB) and may grow to `KATA_MAX_MEMORY_MIB` (24576). The scheduler request is 16Gi. The cgroup limit is 26Gi so QEMU and virtiofsd still fit when the guest reaches 24Gi. virtio-mem is the grow path. The balloon does not grow the guest. It returns pages the guest has freed, and it cannot return a page nvkvm has pinned for the GPU. nvkvm-kata's hypervisor is QEMU, so both devices exist. Firecracker does not have them. Rebuild the guest after the `CONFIG_VIRTIO_MEM` and `CONFIG_VIRTIO_BALLOON` lines, or the extra memory never comes online. The GPU node needs `vm.overcommit_memory=1`.
 
 Keep every name that was already in `enable_annotations`. Add the shim to `valid_hypervisor_paths` if that list is not empty. `kernel_params` is a trusted annotation: anyone who can create a pod on this RuntimeClass can point the shim at a login directory under `GS_PERSIST_ROOT`. The orchestrator is the only creator. Listing `firmware` without `kernel_params` is the broken case: Kata passes `-bios` and the shim never sees the variable-store path, so it cannot rewrite it.
 
