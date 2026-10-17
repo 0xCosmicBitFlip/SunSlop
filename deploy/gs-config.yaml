@@ -51,6 +51,16 @@ data:
   SEAT_GID: "1000"
   SEAT_HOME: "/home/gsuser"
   COMMON_MOUNT: "/games"
+  # Host paths for logins whose users.csv games column is common.
+  # Mounted read-write at GAMES_MOUNT and GAMESSD_MOUNT. Not derived from
+  # PERSIST_ROOT; point them at whatever disk holds the libraries. Empty
+  # is correct while every login is unique (the default): those seats do
+  # not mount either path and install into the home directory. Every GPU
+  # node must see the same paths. The directory has to be writable by SEAT_UID.
+  GAMES_HOST: ""
+  GAMESSD_HOST: ""
+  GAMES_MOUNT: "/games"
+  GAMESSD_MOUNT: "/gamessd"
   LAYER_MOUNT: "/gs-layer"
   XDG_RUNTIME_DIR: "/run/user/1000"
   WAYLAND_DISPLAY: "wayland-0"

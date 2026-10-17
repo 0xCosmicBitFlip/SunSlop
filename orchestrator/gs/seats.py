@@ -338,6 +338,32 @@ class Seats:
 
 
 
+def games_volumes(cfg, user):
+    """common mounts GAMES_HOST and GAMESSD_HOST read-write. unique mounts neither."""
+    mode = getattr(user, "games", "") or "unique"
+    if mode != "common":
+        return [], [], []
+    host = (getattr(cfg, "games_host", "") or "").strip()
+    ssd = (getattr(cfg, "gamessd_host", "") or "").strip()
+    if not host or not ssd:
+        raise ValueError(f"{user.name}: common needs GAMES_HOST and GAMESSD_HOST")
+    mount = getattr(cfg, "games_mount", "") or "/games"
+    ssd_mount = getattr(cfg, "gamessd_mount", "") or "/gamessd"
+    mounts = [
+        {"name": "games", "mountPath": mount},
+        {"name": "gamessd", "mountPath": ssd_mount},
+    ]
+    volumes = [
+        {"name": "games", "hostPath": {"path": host, "type": "DirectoryOrCreate"}},
+        {"name": "gamessd", "hostPath": {"path": ssd, "type": "DirectoryOrCreate"}},
+    ]
+    env = [
+        {"name": "GS_GAMES", "value": mount},
+        {"name": "GS_GAMESSD", "value": ssd_mount},
+    ]
+    return mounts, volumes, env
+
+
 def probe_failures(ready_timeout, period=2):
     """Kubelet checks for the labwc socket this many times.
 
@@ -416,7 +442,6 @@ def seat_pod(cfg, user, gpu, node=None):
         {"name": "GS_GID", "value": str(cfg.seat_gid)},
         {"name": "GS_HOME", "value": cfg.seat_home},
         {"name": "GS_LAYER", "value": cfg.layer_mount},
-        {"name": "GS_COMMON", "value": cfg.common_mount},
         {"name": "XDG_RUNTIME_DIR", "value": cfg.xdg_runtime},
         {"name": "WAYLAND_DISPLAY", "value": cfg.wayland_display},
     ]
@@ -425,17 +450,19 @@ def seat_pod(cfg, user, gpu, node=None):
         env.append({"name": "GS_TPU_DEVICE", "value": "/dev/virtio-ports/org.sunslop.tpu"})
     mounts = [
         {"name": "home", "mountPath": cfg.seat_home},
-        {"name": "common", "mountPath": cfg.common_mount, "readOnly": True},
         {"name": "pod-etc", "mountPath": "/etc", "subPath": "etc"},
         {"name": "layer", "mountPath": "/usr", "subPath": "usr", "readOnly": True},
         {"name": "layer", "mountPath": "/opt", "subPath": "opt", "readOnly": True},
     ]
     volumes = [
         {"name": "home", "hostPath": {"path": home, "type": "DirectoryOrCreate"}},
-        {"name": "common", "hostPath": {"path": cfg.common_host, "type": "DirectoryOrCreate"}},
         {"name": "layer", "hostPath": {"path": layer, "type": "DirectoryOrCreate"}},
         {"name": "pod-etc", "emptyDir": {}},
     ]
+    game_mounts, game_volumes, game_env = games_volumes(cfg, user)
+    mounts[1:1] = game_mounts
+    volumes[1:1] = game_volumes
+    env.extend(game_env)
     # Memory-backed and private. Not the shared layer, and not another seat's home.
     for name, path, size in (
         ("tmp", "/tmp", "6Gi"),

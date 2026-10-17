@@ -83,6 +83,10 @@ class Config:
     orch_stale: int = 15
     claim_grace: int = 45
     instance: str = ""
+    games_host: str = ""
+    gamessd_host: str = ""
+    games_mount: str = "/games"
+    gamessd_mount: str = "/gamessd"
 
 
 def env_get(name, default):
@@ -206,6 +210,16 @@ def load_config():
         os.environ.get("POD_NAME") or os.environ.get("HOSTNAME") or "gs-orchestrator-0",
         "POD_NAME",
     )
+    games_host = os.environ.get("GAMES_HOST", "").strip()
+    gamessd_host = os.environ.get("GAMESSD_HOST", "").strip()
+    if games_host:
+        games_host = _safe(games_host, "GAMES_HOST")
+    if gamessd_host:
+        gamessd_host = _safe(gamessd_host, "GAMESSD_HOST")
+    games_mount = _safe(env_get("GAMES_MOUNT", "/games"), "GAMES_MOUNT").rstrip("/")
+    gamessd_mount = _safe(env_get("GAMESSD_MOUNT", "/gamessd"), "GAMESSD_MOUNT").rstrip("/")
+    if games_mount == gamessd_mount:
+        raise SystemExit("GAMES_MOUNT and GAMESSD_MOUNT are the same path")
     return Config(
         node=os.environ["NODE_NAME"],
         namespace=os.environ.get("POD_NAMESPACE", ""),
@@ -286,6 +300,10 @@ def load_config():
         orch_stale=env_int("ORCH_STALE_SECONDS", 15),
         claim_grace=env_int("CLAIM_GRACE", 45),
         instance=instance,
+        games_host=games_host,
+        gamessd_host=gamessd_host,
+        games_mount=games_mount,
+        gamessd_mount=gamessd_mount,
     )
 
 

@@ -140,6 +140,7 @@ class User:
     name: str
     password: str
     base: int
+    games: str = "unique"
 
     @property
     def pod_name(self):
@@ -158,7 +159,12 @@ def reserved_names(*extra):
 
 
 def load_users(text, reserved=None):
-    """username,password,sunshine_base_port. '#' comments. No commas in fields."""
+    """username,password,base_port[,games]. '#' comments. No commas in fields.
+
+    games is common or unique. Omitted means unique: the seat does not
+    mount /games or /gamessd. common uses the host paths from GAMES_HOST
+    and GAMESSD_HOST.
+    """
     users = {}
     taken = []
     blocked = reserved_names() if reserved is None else set(reserved)
@@ -167,9 +173,12 @@ def load_users(text, reserved=None):
         if not line or line.startswith("#"):
             continue
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) != 3:
-            raise ValueError(f"{lineno}: want username,password,base_port")
-        name, password, base_s = parts
+        if len(parts) not in (3, 4):
+            raise ValueError(f"{lineno}: want username,password,base_port[,games]")
+        name, password, base_s = parts[:3]
+        games = parts[3].lower() if len(parts) == 4 and parts[3] else "unique"
+        if games not in ("common", "unique"):
+            raise ValueError(f"{lineno}: games must be common or unique")
         if not _ok_name(name, blocked):
             raise ValueError(f"{lineno}: bad username {name!r}")
         if not password or password.startswith("CHANGE_ME"):
@@ -184,7 +193,7 @@ def load_users(text, reserved=None):
             if not (hi < olo or lo > ohi):
                 raise ValueError(f"{lineno}: {name} {lo}-{hi} overlaps {other}")
         taken.append((lo, hi, name))
-        users[name] = User(name, password, base)
+        users[name] = User(name, password, base, games)
     return users
 
 

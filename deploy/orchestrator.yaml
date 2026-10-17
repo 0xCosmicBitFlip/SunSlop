@@ -84,7 +84,9 @@ data:
   # base is only the listen span when CERT_PROXY=false. It must still not overlap.
   # password is the Selkies login. Moonlight pairs at /pair, not with a pod.
   users.csv: |
-    # username,password,base_port
+    # username,password,base_port[,games]
+    # games is common or unique. Omitted means unique: no /games and no
+    # /gamessd. common mounts GAMES_HOST and GAMESSD_HOST, both read-write.
     # Logins only. The unix account inside the seat is SEAT_USER in gs-config.
     # With CERT_PROXY=false the first base must be SUNSHINE_BASE, and each
     # following base is that port plus n times USER_PORT_STRIDE

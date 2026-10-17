@@ -85,6 +85,79 @@ def derive(values):
     return values
 
 
+def csv_modes(orch_text):
+    """games column from the users.csv block. Missing column is unique."""
+    modes = {}
+    in_csv = False
+    for line in orch_text.splitlines():
+        if not in_csv:
+            if line.strip() == "users.csv: |":
+                in_csv = True
+            continue
+        if line and not line.startswith(" "):
+            break
+        raw = line.strip()
+        if not raw or raw.startswith("#"):
+            continue
+        parts = [part.strip() for part in raw.split(",")]
+        if len(parts) < 3 or not parts[0] or parts[0].startswith("$"):
+            continue
+        mode = parts[3].lower() if len(parts) >= 4 and parts[3] else "unique"
+        modes[parts[0]] = mode
+    return modes
+
+
+def games_blocks(mode, host, ssd_host, mount, ssd_mount):
+    """YAML pieces for seat-direct. unique omits both mounts."""
+    if mode != "common":
+        return {"GAMES_ENV": "", "GAMES_MOUNTS": "", "GAMES_VOLUMES": ""}
+    if not host or not ssd_host:
+        raise SystemExit("a common login needs GAMES_HOST and GAMESSD_HOST")
+    env = (
+        "        - name: GS_GAMES\n"
+        f"          value: {mount}\n"
+        "        - name: GS_GAMESSD\n"
+        f"          value: {ssd_mount}\n"
+    )
+    mounts = (
+        "        - name: games\n"
+        f"          mountPath: {mount}\n"
+        "        - name: gamessd\n"
+        f"          mountPath: {ssd_mount}\n"
+    )
+    volumes = (
+        "    - name: games\n"
+        "      hostPath:\n"
+        f"        path: {host}\n"
+        "        type: DirectoryOrCreate\n"
+        "    - name: gamessd\n"
+        "      hostPath:\n"
+        f"        path: {ssd_host}\n"
+        "        type: DirectoryOrCreate\n"
+    )
+    return {"GAMES_ENV": env, "GAMES_MOUNTS": mounts, "GAMES_VOLUMES": volumes}
+
+
+def apply_games(values, orch_text):
+    modes = csv_modes(orch_text)
+    bad = sorted(user for user, mode in modes.items() if mode not in ("common", "unique"))
+    if bad:
+        raise SystemExit("users.csv games column must be common or unique: " + ", ".join(bad))
+    if any(mode == "common" for mode in modes.values()):
+        if not values.get("GAMES_HOST") or not values.get("GAMESSD_HOST"):
+            raise SystemExit("a user is common but GAMES_HOST or GAMESSD_HOST is empty")
+    user = values.get("SEAT_DIRECT_USER", "")
+    mode = modes.get(user, "unique")
+    values.update(games_blocks(
+        mode,
+        values.get("GAMES_HOST", ""),
+        values.get("GAMESSD_HOST", ""),
+        values.get("GAMES_MOUNT", "/games"),
+        values.get("GAMESSD_MOUNT", "/gamessd"),
+    ))
+    return values
+
+
 def fill(text, values, path):
     missing = sorted(set(PLACE.findall(text)) - set(values))
     if missing:
@@ -111,7 +184,21 @@ def placeholder_lines(text):
 def main(argv):
     if "--self-test" in argv:
         values = derive(load_config(HERE / "gs-config.yaml"))
+        apply_games(values, (HERE / "orchestrator.yaml").read_text())
         assert values["SEAT_PROBE_FAILURES"] == "450", values["SEAT_PROBE_FAILURES"]
+        assert values["GAMES_ENV"] == ""
+        modes = csv_modes("  users.csv: |\n    alice,pw,1,common\n    bob,pw,2\n")
+        assert modes == {"alice": "common", "bob": "unique"}
+        blocks = games_blocks("common", "/mnt/library", "/mnt/fast", "/games", "/gamessd")
+        assert "readOnly" not in blocks["GAMES_MOUNTS"]
+        assert "path: /mnt/fast" in blocks["GAMES_VOLUMES"]
+        assert games_blocks("unique", "", "", "/games", "/gamessd")["GAMES_MOUNTS"] == ""
+        try:
+            games_blocks("common", "", "/mnt/fast", "/games", "/gamessd")
+            raise SystemExit("common without GAMES_HOST accepted")
+        except SystemExit as exc:
+            if "GAMES_HOST" not in str(exc):
+                raise
         proxy = fill((HERE / "proxy.yaml").read_text(), values, HERE / "proxy.yaml")
         assert "hostNetwork:" not in proxy
         assert "hostPort:" not in proxy
@@ -128,12 +215,15 @@ def main(argv):
         seat = fill((HERE / "seat-direct.yaml").read_text(), values, HERE / "seat-direct.yaml")
         assert "ovn.kubernetes.io/logical_switch: ovn-default" in seat
         assert "cs1-resident" not in seat
+        assert "name: games" not in seat
+        assert "name: gamessd" not in seat
         sample = (HERE / "orchestrator.yaml").read_text()
         assert placeholder_lines(sample), "sample manifest has no CHANGE_ME secrets"
         assert not placeholder_lines("# CHANGE_ME in a comment\nkey: value\n")
         print("render self-test ok")
         return 0
     values = derive(load_config(HERE / "gs-config.yaml"))
+    apply_games(values, (HERE / "orchestrator.yaml").read_text())
     names = ["gs-config.yaml", "orchestrator.yaml", "cache.yaml", "proxy.yaml"]
     if "--time-slicing" in argv:
         names.append("time-slicing.yaml")

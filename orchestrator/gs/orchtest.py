@@ -34,9 +34,11 @@ def self_test():
     cache_test()
     board_test()
     users = load_users(
-        "# c\ngsuser0,secret,47989\ngsuser1,other,48089\n"
+        "# c\ngsuser0,secret,47989\ngsuser1,other,48089,unique\n"
     )
     assert set(users) == {"gsuser0", "gsuser1"}
+    assert users["gsuser0"].games == "unique"
+    assert users["gsuser1"].games == "unique"
     assert list(port_span(47989))[0] == 47984
     assert list(port_span(47989))[-1] == 48010
     assert len(list(port_span(47989))) == SPAN
@@ -70,6 +72,13 @@ def self_test():
         raise SystemExit("placeholder password accepted")
     except ValueError:
         pass
+    try:
+        load_users("gsuser0,secret,47989,shared\n")
+        raise SystemExit("bad games mode accepted")
+    except ValueError:
+        pass
+    marked = load_users("gsuser0,secret,47989,common\ngsuser1,other,48089\n")
+    assert marked["gsuser0"].games == "common"
     assert probe_failures(900) == 450
     assert probe_failures(901) == 451
     secret = b"0123456789abcdef"
@@ -109,7 +118,7 @@ def self_test():
     )[0]
     pod = seat_pod(cfg, users["gsuser0"], 1)
     assert pod["spec"]["volumes"][0]["hostPath"]["path"].endswith("/gsuser0")
-    assert pod["spec"]["volumes"][1]["hostPath"]["path"].endswith("/common")
+    assert pod["spec"]["volumes"][1]["hostPath"]["path"].endswith("/gs-layer")
     assert pod["spec"]["nodeName"] == "n1"
     assert pod["metadata"]["labels"]["gamestream.local/gpu"] == "1"
     assert pod["metadata"]["annotations"][ACTIVITY].isdigit()
@@ -141,9 +150,10 @@ def self_test():
     assert env["GS_LAYER"] == "/gs-layer"
     assert env["GS_HOME"] == "/home/gsuser"
     assert env["GS_USER"] == "gsuser"
+    assert "GS_GAMES" not in env
     assert env["GS_TPU_STATE"] == "/home/gsuser/tpu"
     assert env["GS_TPU_DEVICE"] == "/dev/virtio-ports/org.sunslop.tpu"
-    assert pod["spec"]["volumes"][2]["hostPath"]["path"].endswith("/gs-layer")
+    assert pod["spec"]["volumes"][1]["hostPath"]["path"].endswith("/gs-layer")
     desktop = pod["spec"]["containers"][0]
     sec = desktop["securityContext"]
     assert sec["readOnlyRootFilesystem"] is True
@@ -158,7 +168,7 @@ def self_test():
     mounts = {item["mountPath"]: item for item in desktop["volumeMounts"]}
     assert mounts["/usr"]["readOnly"] is True and mounts["/usr"]["subPath"] == "usr"
     assert mounts["/opt"]["readOnly"] is True
-    assert mounts["/games"]["readOnly"] is True
+    assert "/games" not in mounts and "/gamessd" not in mounts
     assert mounts["/etc"]["subPath"] == "etc"
     assert "/gs-layer" not in mounts
     names = [item["name"] for item in desktop["volumeMounts"]]
@@ -188,11 +198,28 @@ def self_test():
     assert env["GS_HOME"] == "/home/player"
     assert env["GS_LAYER"] == "/packages"
     assert env["SELKIES_PORT"] == "9090"
-    assert pod["spec"]["volumes"][2]["hostPath"]["path"] == "/data/persist/packages"
+    assert pod["spec"]["volumes"][1]["hostPath"]["path"] == "/data/persist/packages"
     assert pod["spec"]["containers"][0]["volumeMounts"][0]["mountPath"] == "/home/player"
     assert pod["spec"]["containers"][0]["readinessProbe"]["exec"]["command"][-1] == "test -S /run/user/2000/wayland-1"
     assert pod["metadata"]["annotations"]["io.katacontainers.config.hypervisor.default_memory"] == "8192"
     assert pod["spec"]["containers"][0]["resources"]["requests"]["memory"] == "4Gi"
+    cfg.games_host = "/mnt/library"
+    cfg.gamessd_host = "/mnt/fast"
+    shared = seat_pod(cfg, marked["gsuser0"], 1)
+    sm = {item["mountPath"]: item for item in shared["spec"]["containers"][0]["volumeMounts"]}
+    assert sm["/games"].get("readOnly") is not True
+    assert sm["/gamessd"].get("readOnly") is not True
+    sv = {item["name"]: item for item in shared["spec"]["volumes"]}
+    assert sv["games"]["hostPath"]["path"] == "/mnt/library"
+    assert sv["gamessd"]["hostPath"]["path"] == "/mnt/fast"
+    alone = seat_pod(cfg, marked["gsuser1"], 0)
+    assert "/games" not in {item["mountPath"] for item in alone["spec"]["containers"][0]["volumeMounts"]}
+    cfg.games_host = ""
+    try:
+        seat_pod(cfg, marked["gsuser0"], 0)
+        raise SystemExit("common seat without GAMES_HOST accepted")
+    except ValueError:
+        pass
     assert public_base(cfg, "10.1.1.9") == "http://10.1.1.9:8080"
     nodes = {"b": "2.2.2.2", "a": "1.1.1.1"}
     assert pick_node("a", nodes, lambda n: True) == ("a", "1.1.1.1")

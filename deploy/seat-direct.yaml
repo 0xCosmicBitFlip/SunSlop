@@ -106,9 +106,7 @@ spec:
           value: ${SEAT_HOME}
         - name: GS_LAYER
           value: ${LAYER_MOUNT}
-        - name: GS_COMMON
-          value: ${COMMON_MOUNT}
-        - name: XDG_RUNTIME_DIR
+${GAMES_ENV}        - name: XDG_RUNTIME_DIR
           value: ${XDG_RUNTIME_DIR}
         - name: WAYLAND_DISPLAY
           value: ${WAYLAND_DISPLAY}
@@ -141,10 +139,7 @@ spec:
       volumeMounts:
         - name: home
           mountPath: ${SEAT_HOME}
-        - name: common
-          mountPath: ${COMMON_MOUNT}
-          readOnly: true
-        - name: pod-etc
+${GAMES_MOUNTS}        - name: pod-etc
           mountPath: /etc
           subPath: etc
         - name: layer
@@ -173,11 +168,7 @@ spec:
       hostPath:
         path: ${PERSIST_ROOT}/${SEAT_DIRECT_USER}
         type: DirectoryOrCreate
-    - name: common
-      hostPath:
-        path: ${PERSIST_ROOT}/${COMMON_DIR}
-        type: DirectoryOrCreate
-    - name: layer
+${GAMES_VOLUMES}    - name: layer
       hostPath:
         path: ${PERSIST_ROOT}/${LAYER_DIR}
         type: DirectoryOrCreate

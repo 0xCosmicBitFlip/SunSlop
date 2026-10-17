@@ -41,10 +41,12 @@ Two values in that file are site paths, not secrets, and the committed defaults 
 Logins and the Selkies passwords live in `users.csv` inside [deploy/orchestrator.yaml](deploy/orchestrator.yaml). The cookie HMAC key and the admin password live in the `gs-cookie` Secret in that same file. The committed values are placeholders. Replace them before `kubectl apply`. An empty `admin.password` leaves the debug page open on the proxy.
 
 ```
-username,password,sunshine_base_port
+username,password,sunshine_base_port[,games]
 gsuser0,CHANGE_ME_selkies_password,47989
-gsuser1,CHANGE_ME_selkies_password,48089
+gsuser1,CHANGE_ME_selkies_password,48089,common
 ```
+
+`games` is `common` or `unique`. Leave it off for `unique`. `common` needs `GAMES_HOST` and `GAMESSD_HOST` in [deploy/gs-config.yaml](deploy/gs-config.yaml). `render.py` refuses to print manifests if a login is `common` and either path is empty.
 
 ```yaml
 stringData:
@@ -123,7 +125,7 @@ kubectl -n "$NS" rollout status ds/gs-proxy
 
 Point Traefik at Service `gs-proxy`, not at the orchestrator. The orchestrator Service is how the proxies reach `POST /v1/ensure`.
 
-Homes land on `<PERSIST_ROOT>/<login>`. The shared directory is `<PERSIST_ROOT>/<COMMON_DIR>`, mounted read-only at `COMMON_MOUNT` in the seat (`/games`). The package layer is `<PERSIST_ROOT>/<LAYER_DIR>`. The init container mounts that directory at `LAYER_MOUNT` (`/gs-layer`) and is the only writer. The desktop mounts `usr` and `opt` from it read-only and does not see the layer directory. The proxy store is `<PERSIST_ROOT>/<PROXY_DIR>`. Both the proxy and the orchestrator mount `PERSIST_ROOT` at `PERSIST_MOUNT`. `COMMON_DIR`, `LAYER_DIR`, and `PROXY_DIR` are not legal logins. The desktop user inside the seat is `SEAT_USER` (`gsuser`, uid `SEAT_UID`), which is not a login name. The image's build-time account is overwritten from those values at boot, in the pod's private `/etc` only. Rebuild the seat image only if you change packages in the Dockerfile, not if you rename the account.
+Homes land on `<PERSIST_ROOT>/<login>`. A login is `unique` unless `users.csv` says `common`. `unique` does not mount `/games` or `/gamessd`; installs go in the home directory. `common` mounts `GAMES_HOST` at `/games` and `GAMESSD_HOST` at `/gamessd`, both read-write. Those two host paths are not under `PERSIST_ROOT` unless you point them there, and every GPU node has to see them. The directory must be writable by `SEAT_UID`. The package layer is `<PERSIST_ROOT>/<LAYER_DIR>`. The init container mounts that directory at `LAYER_MOUNT` (`/gs-layer`) and is the only writer. The desktop mounts `usr` and `opt` from it read-only and does not see the layer directory. The proxy store is `<PERSIST_ROOT>/<PROXY_DIR>`. Both the proxy and the orchestrator mount `PERSIST_ROOT` at `PERSIST_MOUNT`. `COMMON_DIR`, `LAYER_DIR`, and `PROXY_DIR` are not legal logins. The desktop user inside the seat is `SEAT_USER` (`gsuser`, uid `SEAT_UID`), which is not a login name. The image's build-time account is overwritten from those values at boot, in the pod's private `/etc` only. Rebuild the seat image only if you change packages in the Dockerfile, not if you rename the account.
 
 ```bash
 python3 deploy/render.py --time-slicing | kubectl apply -f -
@@ -184,7 +186,7 @@ Startup packages are shared. They are not installed into each home, and they are
 
 The seat image stays the base desktop. An init container, `layer-init`, is the only writer. It flock-seeds `/usr`, `/etc`, and `/opt` into `<LAYER_MOUNT>` when the image changes, runs dnf, then copies `/etc` into an emptyDir private to this pod. That copy gets this pod's `resolv.conf`, `hosts`, `hostname`, and a new `machine-id`. The shared `/etc` is not mounted in the desktop container. The desktop mounts `usr` and `opt` from the layer **read-only**, and it does not mount the layer directory itself.
 
-`<PERSIST_ROOT>/<LAYER_DIR>` is its own directory on the persistent disk, not a folder inside `COMMON_MOUNT`. The first seat to see a new image does the copy. Later seats take the flock, see the same image id and the same package list, and only publish the private `/etc`. Sixteen seats share one `/usr`.
+`<PERSIST_ROOT>/<LAYER_DIR>` is its own directory on the persistent disk. The first seat to see a new image does the copy. Later seats take the flock, see the same image id and the same package list, and only publish the private `/etc`. Sixteen seats share one `/usr`.
 
 The list is `/etc/gamestream/packages.list` in the image. If `<LAYER_MOUNT>/packages.list` exists, it replaces that list. One name per line. A package that is already in the rpmdb is skipped. A package this layer installed earlier and that is no longer on the list is `dnf remove`d. Nothing runs `dnf update`. `steam` enables RPM Fusion nonfree when it is missing. Steam itself stays commented out.
 
@@ -196,7 +198,7 @@ What is shared, and what is this pod's:
 | `/etc` in the layer | init container only | Package config. Not mounted in the desktop. |
 | `/etc` in the pod | this desktop | Private copy: DNS, hostname, machine-id, the unix account. Discarded with the pod. |
 | `<SEAT_HOME>` | this login | Steam, Proton prefixes, Sunshine state, shader cache. One seat per login. |
-| `COMMON_MOUNT` (`/games`) | nobody in the pod | Shared library, read-only. A seat cannot replace a binary another seat runs. Stage files on the host. Per-user installs go in the home. |
+| `/games`, `/gamessd` | `common` logins, read-write | `GAMES_HOST` and `GAMESSD_HOST`. Not mounted for `unique`. |
 | `/tmp`, `/var/tmp`, `/var/log`, `/var/cache`, `/run` | this desktop | tmpfs, capped. Wayland, PipeWire, and supervisord live on `/run`. |
 
 `<SEAT_HOME>/packages.list` is ignored. Do not delete `<PERSIST_ROOT>/<LAYER_DIR>`.

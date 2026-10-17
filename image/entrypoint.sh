@@ -1,9 +1,11 @@
 #!/bin/bash
 # Desktop container. Root here is not allowed to change the shared layer.
 # The init container (layer-init) has already installed packages and built
-# this pod's /etc. /usr and /opt are read-only mounts. /games is read-only.
-# Writable state is the login's home, plus the tmpfs mounts the pod spec adds
-# (/tmp, /var/tmp, /var/log, /var/cache, /run).
+# this pod's /etc. /usr and /opt are read-only mounts. /games and /gamessd
+# are mounted read-write only for a common login. A unique login does not
+# have them; installs go in the home directory.
+# Other writable state is the login's home, plus the tmpfs mounts the pod
+# spec adds (/tmp, /var/tmp, /var/log, /var/cache, /run).
 set -euo pipefail
 
 user="${GS_USER:-gsuser}"
@@ -13,7 +15,8 @@ home="${GS_HOME:-/home/${user}}"
 runtime="${XDG_RUNTIME_DIR:-/run/user/${uid}}"
 wayland="${WAYLAND_DISPLAY:-wayland-0}"
 layer="${GS_LAYER:-/gs-layer}"
-common="${GS_COMMON:-/games}"
+games="${GS_GAMES:-}"
+gamessd="${GS_GAMESSD:-}"
 encoder="${SELKIES_ENCODER:-nvh264enc}"
 selkies_port="${SELKIES_PORT:-8082}"
 selkies_addr="${SELKIES_ADDR:-0.0.0.0}"
@@ -25,7 +28,7 @@ case "${user}${uid}${gid}${wayland}${encoder}${selkies_port}${selkies_addr}" in
     exit 1
     ;;
 esac
-case "${home}${runtime}${layer}${common}${config_rel}" in
+case "${home}${runtime}${layer}${games}${gamessd}${config_rel}" in
   *[!a-zA-Z0-9_./-]*)
     echo "seat path has an unsafe character" >&2
     exit 1
@@ -49,9 +52,6 @@ if [[ "${GS_LAYER_ALLOW_UNMOUNTED:-}" != 1 ]]; then
   refuse_writable /usr
   if [[ -d /opt ]]; then
     refuse_writable /opt
-  fi
-  if mountpoint -q "$common" 2>/dev/null; then
-    refuse_writable "$common"
   fi
 fi
 
