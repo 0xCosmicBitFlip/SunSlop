@@ -62,12 +62,32 @@ def _machine(value):
     return ",".join(parts)
 
 
+def persist_roots(env):
+    """HDD and SSD homes. GS_PERSIST_ROOT is accepted as a single root."""
+    found = []
+    for key in ("GS_PERSIST_HDD", "GS_PERSIST_SSD", "GS_PERSIST_ROOT"):
+        val = (env.get(key) or "").strip()
+        if val and val not in found:
+            found.append(val)
+    return found
+
+
 def user_path(root, path, kind):
     """<root>/<login>/tpu or <root>/<login>/uefi/OVMF_VARS.fd. Nothing else.
 
-    '..' is rejected in the raw string. abspath would hide it, and a seat
-    annotation must name the directory it means.
+    root may be one path or a list. A home is valid under either persist
+    root. '..' is rejected in the raw string. abspath would hide it, and a
+    seat annotation must name the directory it means.
     """
+    roots = root if isinstance(root, (list, tuple)) else [root]
+    for item in roots:
+        got = _user_path(item, path, kind)
+        if got:
+            return got
+    return ""
+
+
+def _user_path(root, path, kind):
     root = (root or "").strip()
     if not root or not path or not path.startswith("/") or ".." in path.split("/"):
         return ""
@@ -94,13 +114,13 @@ def plan(argv, env):
 
     Secure Boot that cannot be set up drops -bios instead of booting OVMF
     without a variable store. The TPU is omitted when its path is not the
-    login directory under GS_PERSIST_ROOT.
+    login directory under GS_PERSIST_HDD or GS_PERSIST_SSD.
     """
-    root = env.get("GS_PERSIST_ROOT", "")
+    roots = persist_roots(env)
     code = env.get("GS_UEFI_CODE", "")
     template = env.get("GS_UEFI_TEMPLATE", "")
-    uefi = user_path(root, _token(argv, "sunslop.uefi_vars"), "uefi")
-    tpu = user_path(root, _token(argv, "sunslop.tpu_state"), "tpu")
+    uefi = user_path(roots, _token(argv, "sunslop.uefi_vars"), "uefi")
+    tpu = user_path(roots, _token(argv, "sunslop.tpu_state"), "tpu")
     secure = bool(uefi and code and template and os.path.isfile(code) and os.path.isfile(template))
     out = []
     index = 0
@@ -517,6 +537,10 @@ def _self_test():
     ):
         assert user_path(root, bad, kind) == "", bad
     assert user_path(root, uefi, "uefi") == os.path.abspath(uefi)
+    hdd = tempfile.mkdtemp()
+    hdd_tpu = hdd + "/gsuser1/tpu"
+    assert user_path([root, hdd], hdd_tpu, "tpu") == os.path.abspath(hdd_tpu)
+    assert user_path([root], hdd_tpu, "tpu") == ""
     ensure_vars(uefi, template)
     assert open(uefi, "rb").read() == b"VARS-EMPTY"
     open(uefi, "wb").write(b"ENROLLED")

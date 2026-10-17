@@ -84,16 +84,17 @@ data:
   # base is only the listen span when CERT_PROXY=false. It must still not overlap.
   # password is the Selkies login. Moonlight pairs at /pair, not with a pod.
   users.csv: |
-    # username,password,base_port[,games]
-    # games is common or unique. Omitted means unique: no /games and no
-    # /gamessd. common mounts GAMES_HOST and GAMESSD_HOST, both read-write.
+    # username,password,base_port,games,disk
+    # games is common or unique. disk is hdd or ssd. Both are required.
+    # common mounts GAMES_HOST and GAMESSD_HOST, both read-write.
+    # disk selects PERSIST_HDD_ROOT or PERSIST_SSD_ROOT for that login's home.
     # Logins only. The unix account inside the seat is SEAT_USER in gs-config.
     # With CERT_PROXY=false the first base must be SUNSHINE_BASE, and each
     # following base is that port plus n times USER_PORT_STRIDE
     # (${USER_PORT_STRIDE}). A span is 27 ports. The stride must not overlap.
-    gsuser0,CHANGE_ME_selkies_password,${USER_BASE_0}
-    gsuser1,CHANGE_ME_selkies_password,${USER_BASE_1}
-    gsuser2,CHANGE_ME_selkies_password,${USER_BASE_2}
+    gsuser0,CHANGE_ME_selkies_password,${USER_BASE_0},unique,ssd
+    gsuser1,CHANGE_ME_selkies_password,${USER_BASE_1},unique,hdd
+    gsuser2,CHANGE_ME_selkies_password,${USER_BASE_2},unique,hdd
 ---
 apiVersion: v1
 kind: Secret
@@ -141,6 +142,7 @@ spec:
       annotations:
         ovn.kubernetes.io/logical_switch: ${OVN_BACK_SUBNET}
     spec:
+      runtimeClassName: ${KATA_RUNTIME}
       serviceAccountName: ${ORCH_NAME}
       affinity:
         podAntiAffinity:
@@ -209,5 +211,5 @@ spec:
             secretName: gs-cookie
         - name: persist
           hostPath:
-            path: ${PERSIST_ROOT}
+            path: ${PERSIST_SSD_ROOT}
             type: DirectoryOrCreate

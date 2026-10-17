@@ -45,6 +45,7 @@ spec:
       annotations:
         ovn.kubernetes.io/logical_switch: ${OVN_BACK_SUBNET}
     spec:
+      runtimeClassName: ${KATA_RUNTIME}
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:

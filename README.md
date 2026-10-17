@@ -11,7 +11,7 @@ Kubernetes object names stay `gs-orchestrator`, `gs-proxy`, and `gamestream` unl
 ## What you need
 
 - Kubernetes workers that have already passed [docs/nvkvm-kata.md](docs/nvkvm-kata.md). Do not apply a seat until that gate prints `GATE_OK` and the node is labeled `nvkvm.kata/ready=true`. The proxy DaemonSet requires that label as well as `nvidia.com/gpu.present=true`. Seats are pinned with `nodeName`, which does not re-check the RuntimeClass selector, so an unlabeled node must not be running a proxy.
-- A filesystem mounted at the same `PERSIST_ROOT` on every proxy node and on the orchestrator node.
+- Two filesystems, mounted at the same `PERSIST_HDD_ROOT` and `PERSIST_SSD_ROOT` on every proxy node, on the orchestrator node, and on the ClamAV node.
 - The seat image imported on every GPU node, and one control-plane image (`ORCH_IMAGE`) on every orchestrator node and every proxy node. Redis is a separate image (`REDIS_IMAGE`, `redis:7.4-alpine`). The orchestrator and the proxy use the control-plane image. `GS_ROLE` on the pod is what the entrypoint runs: `orchestrator` starts `orchestrator.py`, `proxy` compiles `gs-relay` and starts `moonlight_proxy.py`.
 - Traefik, or anything else that can route HTTP to Service `gs-proxy` on the back network. Moonlight does not go through that HTTP route. It dials the Sunshine ports on the proxy's `cs1-resident` address.
 
@@ -36,17 +36,18 @@ Two values in that file are site paths, not secrets, and the committed defaults 
 | Key | Committed default | Replace with |
 |---|---|---|
 | `NAMESPACE` | `gamestream` | Your namespace. |
-| `PERSIST_ROOT` | `/var/lib/gamestream/persistent` | The shared host directory. The same string on every node. |
+| `PERSIST_HDD_ROOT` | `/var/lib/gamestream/hdd` | Homes whose `users.csv` disk column is `hdd`. |
+| `PERSIST_SSD_ROOT` | `/var/lib/gamestream/ssd` | Homes whose disk column is `ssd`, plus the proxy store, the package layer, and ClamAV. |
 
 Logins and the Selkies passwords live in `users.csv` inside [deploy/orchestrator.yaml](deploy/orchestrator.yaml). The cookie HMAC key and the admin password live in the `gs-cookie` Secret in that same file. The committed values are placeholders. Replace them before `kubectl apply`. An empty `admin.password` leaves the debug page open on the proxy.
 
 ```
-username,password,sunshine_base_port[,games]
-gsuser0,CHANGE_ME_selkies_password,47989
-gsuser1,CHANGE_ME_selkies_password,48089,common
+username,password,sunshine_base_port,games,disk
+gsuser0,CHANGE_ME_selkies_password,47989,unique,ssd
+gsuser1,CHANGE_ME_selkies_password,48089,unique,hdd
 ```
 
-`games` is `common` or `unique`. Leave it off for `unique`. `common` needs `GAMES_HOST` and `GAMESSD_HOST` in [deploy/gs-config.yaml](deploy/gs-config.yaml). `render.py` refuses to print manifests if a login is `common` and either path is empty.
+`games` is `common` or `unique` and is required. `disk` is `hdd` or `ssd` and is required. `common` needs `GAMES_HOST` and `GAMESSD_HOST` in [deploy/gs-config.yaml](deploy/gs-config.yaml). `render.py` refuses to print manifests if a login is `common` and either path is empty. `disk` is which persist root that home is created on.
 
 ```yaml
 stringData:
@@ -64,7 +65,7 @@ The password column is the Selkies login. `Directory.authenticate` checks it. Wi
 
 ## Pairing
 
-Moonlight pairs with the proxy, once, from `/pair`. Sign in with the same password as the desktop. Start pairing in Moonlight and type the four digits that client is showing. The certificate on that handshake is stored for the login in the cookie, not for a user picked from a list. Two people can do this at the same time: each PIN is applied only to the client that is waiting for it. A wrong PIN, or a PIN for a client someone else already claimed, does not move the certificate. Removing a client is on that same page and only removes one that is already on this login. The store is `<PERSIST_ROOT>/<PROXY_DIR>/store.json`, mounted at `<PERSIST_MOUNT>/<PROXY_DIR>/store.json`, so any proxy can finish a pairing another proxy started.
+Moonlight pairs with the proxy, once, from `/pair`. Sign in with the same password as the desktop. Start pairing in Moonlight and type the four digits that client is showing. The certificate on that handshake is stored for the login in the cookie, not for a user picked from a list. Two people can do this at the same time: each PIN is applied only to the client that is waiting for it. A wrong PIN, or a PIN for a client someone else already claimed, does not move the certificate. Removing a client is on that same page and only removes one that is already on this login. The store is `<PERSIST_SSD_ROOT>/<PROXY_DIR>/store.json`, mounted at `<PERSIST_MOUNT>/<PROXY_DIR>/store.json`, so any proxy can finish a pairing another proxy started.
 
 There is one proxy keypair, not one per user. The first proxy or orchestrator to start generates it and leaves it in that store. The public PEM is written beside it as `PROXY_CLIENT_CERT` (`proxy-client.crt`, mode 0644). Every seat mounts that file read-only at `PROXY_CERT_MOUNT`. `seat-boot.py` installs it into `sunshine_state.json` under `PROXY_CLIENT_NAME` on every boot, replacing the previous cert of that name and keeping the device uuid. Do not pair a pod by hand, and do not mint a per-user pod certificate. `/admin` reports whether each login's state file contains the shared cert.
 
@@ -121,11 +122,13 @@ kubectl -n "$NS" rollout status sts/gs-redis
 kubectl -n "$NS" rollout status ds/gs-proxy
 ```
 
-`$NS` is `NAMESPACE`. The command fails while `CHANGE_ME` is still in `users.csv` or the `gs-cookie` Secret. `python3 deploy/render.py --allow-placeholders` prints the manifests anyway; do not apply that output. The orchestrator and the proxy refuse to start if the cookie secret or `ADMIN_PASSWORD` is still a placeholder, if `PERSIST_MOUNT` is not a mount, or if `PERSIST_MOUNT/.sunslop-volume` is missing. Create that empty file once on the host at `PERSIST_ROOT/.sunslop-volume`. A node-local `DirectoryOrCreate` does not have it, so it cannot mint a second certificate.
+`$NS` is `NAMESPACE`. The command fails while `CHANGE_ME` is still in `users.csv` or the `gs-cookie` Secret. `python3 deploy/render.py --allow-placeholders` prints the manifests anyway; do not apply that output. The orchestrator and the proxy refuse to start if the cookie secret or `ADMIN_PASSWORD` is still a placeholder, if `PERSIST_MOUNT` is not a mount, or if `PERSIST_MOUNT/.sunslop-volume` is missing. Create that empty file once on the host at `PERSIST_SSD_ROOT/.sunslop-volume`, and the same name on `PERSIST_HDD_ROOT`. A node-local `DirectoryOrCreate` does not have it, so it cannot mint a second certificate.
 
 Point Traefik at Service `gs-proxy`, not at the orchestrator. The orchestrator Service is how the proxies reach `POST /v1/ensure`.
 
-Homes land on `<PERSIST_ROOT>/<login>`. A login is `unique` unless `users.csv` says `common`. `unique` does not mount `/games` or `/gamessd`; installs go in the home directory. `common` mounts `GAMES_HOST` at `/games` and `GAMESSD_HOST` at `/gamessd`, both read-write. Those two host paths are not under `PERSIST_ROOT` unless you point them there, and every GPU node has to see them. The directory must be writable by `SEAT_UID`. The package layer is `<PERSIST_ROOT>/<LAYER_DIR>`. The init container mounts that directory at `LAYER_MOUNT` (`/gs-layer`) and is the only writer. The desktop mounts `usr` and `opt` from it read-only and does not see the layer directory. The proxy store is `<PERSIST_ROOT>/<PROXY_DIR>`. Both the proxy and the orchestrator mount `PERSIST_ROOT` at `PERSIST_MOUNT`. `COMMON_DIR`, `LAYER_DIR`, and `PROXY_DIR` are not legal logins. The desktop user inside the seat is `SEAT_USER` (`gsuser`, uid `SEAT_UID`), which is not a login name. The image's build-time account is overwritten from those values at boot, in the pod's private `/etc` only. Rebuild the seat image only if you change packages in the Dockerfile, not if you rename the account.
+Homes land on `<PERSIST_HDD_ROOT>/<login>` or `<PERSIST_SSD_ROOT>/<login>`, from the `disk` column. `games` is `common` or `unique` and is required. `unique` does not mount `/games` or `/gamessd`; installs go in the home directory. `common` mounts `GAMES_HOST` at `/games` and `GAMESSD_HOST` at `/gamessd`, both read-write. Those two host paths are not under either persist root unless you point them there, and every GPU node has to see them. The directory must be writable by `SEAT_UID`. The package layer is `<PERSIST_SSD_ROOT>/<LAYER_DIR>`. The init container mounts that directory at `LAYER_MOUNT` (`/gs-layer`) and is the only writer. The desktop mounts `usr` and `opt` from it read-only and does not see the layer directory. The proxy store is `<PERSIST_SSD_ROOT>/<PROXY_DIR>`. Both the proxy and the orchestrator mount the SSD root at `PERSIST_MOUNT`. `COMMON_DIR`, `LAYER_DIR`, `PROXY_DIR`, and `clamav` are not legal logins. The desktop user inside the seat is `SEAT_USER` (`gsuser`, uid `SEAT_UID`), which is not a login name. The image's build-time account is overwritten from those values at boot, in the pod's private `/etc` only. Rebuild the seat image only if you change packages in the Dockerfile, not if you rename the account.
+
+The orchestrator, the proxy, Redis, and ClamAV use `KATA_RUNTIME` (the upstream RuntimeClass `kata`). Seats stay on `RUNTIME_CLASS` (`nvkvm-kata`). Install that stock RuntimeClass on every node that runs one of those pods, including the GPU nodes, because the proxy is a DaemonSet there. ClamAV is `clamav/clamav`, one pod. It mounts both persist roots and the common game paths, skips `gs-layer`, `proxy`, and `clamav`, and does not scan a file again while its size and mtime are unchanged. `freshclam` refreshes the database on `CLAMAV_UPDATE_SECONDS`. A hit is deleted and replaced by `<name>.threat.txt` containing the signature name. The database and that cache stay on the SSD root.
 
 ```bash
 python3 deploy/render.py --time-slicing | kubectl apply -f -
@@ -162,9 +165,9 @@ A later pause belongs behind `Seats.reap`. Do not widen the Role to get there.
 
 Seats ask the nvkvm VM for a Secure Boot capable firmware and a TPU emulator. The host side is [deploy/kata/gs_kata_shim.py](deploy/kata/gs_kata_shim.py), installed in front of the nvkvm QEMU shim. [docs/nvkvm-kata.md](docs/nvkvm-kata.md) is the node setup: `edk2-ovmf`, `enable_annotations`, and three lines in `shim.env`.
 
-`KATA_FIRMWARE` is `OVMF_CODE.secboot.fd`. The variable store starts as `KATA_FIRMWARE_VARS` and is then `<PERSIST_ROOT>/<login>/uefi/OVMF_VARS.fd`. Out of the box that template is the empty store, so the firmware is Secure Boot capable and Secure Boot is off. An unsigned kernel still boots. To turn Secure Boot on, [deploy/kata/secureboot.sh](deploy/kata/secureboot.sh) makes a unique self-signed site cert, enrolls it as PK, KEK, and db (custom mode, not Setup Mode), and signs the EFI stub kernel and `nvkvm-guest.ko`. Point `GS_UEFI_TEMPLATE` at the enrolled store and set `GS_SB_ENFORCE=1`. The shim then refuses to fall back to an unsigned direct-kernel boot. Delete each login's existing `OVMF_VARS.fd` once, or the old store (Secure Boot off) is kept. `KATA_SECURE_BOOT=false` skips the firmware path.
+`KATA_FIRMWARE` is `OVMF_CODE.secboot.fd`. The variable store starts as `KATA_FIRMWARE_VARS` and is then `<that login's disk>/<login>/uefi/OVMF_VARS.fd`. Out of the box that template is the empty store, so the firmware is Secure Boot capable and Secure Boot is off. An unsigned kernel still boots. To turn Secure Boot on, [deploy/kata/secureboot.sh](deploy/kata/secureboot.sh) makes a unique self-signed site cert, enrolls it as PK, KEK, and db (custom mode, not Setup Mode), and signs the EFI stub kernel and `nvkvm-guest.ko`. Point `GS_UEFI_TEMPLATE` at the enrolled store and set `GS_SB_ENFORCE=1`. The shim then refuses to fall back to an unsigned direct-kernel boot. Delete each login's existing `OVMF_VARS.fd` once, or the old store (Secure Boot off) is kept. `KATA_SECURE_BOOT=false` skips the firmware path.
 
-The TPU is not a Cloud TPU. It is a 1 MiB int8 scratchpad at `/dev/virtio-ports/org.sunslop.tpu`. Its state file is `<PERSIST_ROOT>/<login>/tpu/state.bin` (`TPU_STATE_DIR`), on the same disk as the home directory, and it survives the pod. `TPU_EMULATION=false` skips it. The protocol is in the runtime doc.
+The TPU is not a Cloud TPU. It is a 1 MiB int8 scratchpad at `/dev/virtio-ports/org.sunslop.tpu`. Its state file is `<that login's disk>/<login>/tpu/state.bin` (`TPU_STATE_DIR`), on the same disk as the home directory, and it survives the pod. `TPU_EMULATION=false` skips it. The protocol is in the runtime doc.
 
 ## Desktop kernel
 
@@ -186,7 +189,7 @@ Startup packages are shared. They are not installed into each home, and they are
 
 The seat image stays the base desktop. An init container, `layer-init`, is the only writer. It flock-seeds `/usr`, `/etc`, and `/opt` into `<LAYER_MOUNT>` when the image changes, runs dnf, then copies `/etc` into an emptyDir private to this pod. That copy gets this pod's `resolv.conf`, `hosts`, `hostname`, and a new `machine-id`. The shared `/etc` is not mounted in the desktop container. The desktop mounts `usr` and `opt` from the layer **read-only**, and it does not mount the layer directory itself.
 
-`<PERSIST_ROOT>/<LAYER_DIR>` is its own directory on the persistent disk. The first seat to see a new image does the copy. Later seats take the flock, see the same image id and the same package list, and only publish the private `/etc`. Sixteen seats share one `/usr`.
+`<PERSIST_SSD_ROOT>/<LAYER_DIR>` is its own directory on the SSD. The first seat to see a new image does the copy. Later seats take the flock, see the same image id and the same package list, and only publish the private `/etc`. Sixteen seats share one `/usr`.
 
 The list is `/etc/gamestream/packages.list` in the image. If `<LAYER_MOUNT>/packages.list` exists, it replaces that list. One name per line. A package that is already in the rpmdb is skipped. A package this layer installed earlier and that is no longer on the list is `dnf remove`d. Nothing runs `dnf update`. `steam` enables RPM Fusion nonfree when it is missing. Steam itself stays commented out.
 
@@ -201,7 +204,7 @@ What is shared, and what is this pod's:
 | `/games`, `/gamessd` | `common` logins, read-write | `GAMES_HOST` and `GAMESSD_HOST`. Not mounted for `unique`. |
 | `/tmp`, `/var/tmp`, `/var/log`, `/var/cache`, `/run` | this desktop | tmpfs, capped. Wayland, PipeWire, and supervisord live on `/run`. |
 
-`<SEAT_HOME>/packages.list` is ignored. Do not delete `<PERSIST_ROOT>/<LAYER_DIR>`.
+`<SEAT_HOME>/packages.list` is ignored. Do not delete `<PERSIST_SSD_ROOT>/<LAYER_DIR>`.
 
 The desktop container is `readOnlyRootFilesystem`. Its added capabilities are `SYS_NICE`, `IPC_LOCK`, and `SYS_RESOURCE`, so the entrypoint can raise rtprio, memlock, and nofile before it drops to the desktop user. The game process does not get those capabilities. `allowPrivilegeEscalation` is false, so a setuid `bwrap` will not gain root; Steam Linux Runtime uses a user namespace instead (`CONFIG_USER_NS`). `GS_LAYER_ALLOW_UNMOUNTED=1` is only for a local `docker run` without this pod spec. `LAYER_MOUNT` has to be a mount in the init container.
 

@@ -8,7 +8,8 @@
 #   python3 deploy/render.py | kubectl apply -f -
 #
 # Do not kubectl-edit this ConfigMap on the cluster without rendering again.
-# The persist volume's hostPath has to stay the same string as PERSIST_ROOT.
+# The persist volumes' hostPaths have to stay the same strings as
+# PERSIST_HDD_ROOT and PERSIST_SSD_ROOT.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -20,6 +21,9 @@ data:
   ORCH_IMAGE: "gs-orchestrator:local"
   SEAT_IMAGE: "gamestream:local"
   RUNTIME_CLASS: "nvkvm-kata"
+  # Upstream Kata for the orchestrator, proxy, Redis, and ClamAV.
+  # Seats stay on RUNTIME_CLASS. The RuntimeClass object is not created here.
+  KATA_RUNTIME: "kata"
 
   # Back network. The kube-ovn subnet the default namespace already uses
   # (ovn-default unless that namespace was moved). The orchestrator, the
@@ -34,12 +38,15 @@ data:
   OVN_FRONT_NETWORK: "cs1-resident"
   OVN_FRONT_NAD_NS: "default"
 
-  # Host disk, the same shared filesystem on every proxy node and on the
-  # node that runs the orchestrator. Create <PERSIST_ROOT>/.sunslop-volume
-  # on that filesystem before apply. A node-local empty directory is refused
-  # at startup, because it would mint a second certificate.
-  PERSIST_ROOT: "/var/lib/gamestream/persistent"
-  # Where the orchestrator pod mounts PERSIST_ROOT. This is not a host path.
+  # Two host disks, mounted at these paths on every GPU node and on every
+  # node that runs the orchestrator, the proxy, or ClamAV. Create
+  # <PERSIST_SSD_ROOT>/.sunslop-volume before apply. The orchestrator
+  # refuses to start when that directory is not a mount inside the pod.
+  # Homes come from the disk column in users.csv. The package layer, the
+  # proxy store, and the ClamAV database live on the SSD root only.
+  PERSIST_HDD_ROOT: "/var/lib/gamestream/hdd"
+  PERSIST_SSD_ROOT: "/var/lib/gamestream/ssd"
+  # Where the orchestrator and the proxy mount PERSIST_SSD_ROOT. Not a host path.
   PERSIST_MOUNT: "/var/lib/gs-persist"
   COMMON_DIR: "common"
   LAYER_DIR: "gs-layer"
@@ -53,10 +60,11 @@ data:
   COMMON_MOUNT: "/games"
   # Host paths for logins whose users.csv games column is common.
   # Mounted read-write at GAMES_MOUNT and GAMESSD_MOUNT. Not derived from
-  # PERSIST_ROOT; point them at whatever disk holds the libraries. Empty
-  # is correct while every login is unique (the default): those seats do
-  # not mount either path and install into the home directory. Every GPU
-  # node must see the same paths. The directory has to be writable by SEAT_UID.
+  # PERSIST_HDD_ROOT or PERSIST_SSD_ROOT; point them at whatever disk holds
+  # the libraries. Empty is correct while every login is unique: those
+  # seats do not mount either path and install into the home directory.
+  # Every GPU node, and the ClamAV node, must see the same paths. The
+  # directory has to be writable by SEAT_UID.
   GAMES_HOST: ""
   GAMESSD_HOST: ""
   GAMES_MOUNT: "/games"
@@ -78,12 +86,12 @@ data:
   # VARS image enrolls Microsoft keys and then refuses this guest kernel.
   # After enroll, set this to the same path as GS_UEFI_TEMPLATE
   # (OVMF_VARS.custom.fd) and set GS_SB_ENFORCE=1 in shim.env. The shim
-  # copies the template to <PERSIST_ROOT>/<login>/uefi/ once, and leaves an
+  # copies the template to <disk-root>/<login>/uefi/ once, and leaves an
   # enrolled store alone. Delete that file to pick up a new template.
   KATA_SECURE_BOOT: "true"
   KATA_FIRMWARE: "/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd"
   KATA_FIRMWARE_VARS: "/usr/share/edk2/ovmf/OVMF_VARS.fd"
-  # Scratchpad emulator. State is <PERSIST_ROOT>/<login>/<TPU_STATE_DIR>/state.bin.
+  # Scratchpad emulator. State is <disk-root>/<login>/<TPU_STATE_DIR>/state.bin.
   TPU_EMULATION: "true"
   TPU_STATE_DIR: "tpu"
 
@@ -124,7 +132,7 @@ data:
   SEAT_APP: "gamestream"
   # 1 is one orchestrator. 2 or 3 is n+1. gs-orchestrator-0 is the lowest
   # ordinal and adopts a seat only when its owner's heartbeat is stale.
-  # Every replica needs PERSIST_ROOT mounted. They find each other through
+  # Every replica needs PERSIST_SSD_ROOT mounted. They find each other through
   # the headless Service DNS records, and they keep that state in Redis.
   ORCH_REPLICAS: "1"
   CACHE_NAME: "gs-redis"
@@ -133,6 +141,11 @@ data:
   # dies. The board is memory only. If every Redis pod restarts, it is empty.
   CACHE_REPLICAS: "1"
   REDIS_IMAGE: "redis:7.4-alpine"
+  CLAMAV_IMAGE: "clamav/clamav:1.4"
+  # Seconds. A file is scanned again only when its size or mtime changes.
+  # freshclam runs on the update interval.
+  CLAMAV_SCAN_SECONDS: "300"
+  CLAMAV_UPDATE_SECONDS: "7200"
   # An orchestrator heartbeat older than this is dead. A seat with no
   # activity stamp is kept this long after it is claimed, so a live proxy
   # can check in. Both are seconds.

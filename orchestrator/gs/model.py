@@ -140,14 +140,15 @@ class User:
     name: str
     password: str
     base: int
-    games: str = "unique"
+    games: str
+    disk: str
 
     @property
     def pod_name(self):
         return "gs-" + self.name
 
 
-DEFAULT_RESERVED = ("common", "layer", "proxy", "gs-layer")
+DEFAULT_RESERVED = ("common", "layer", "proxy", "gs-layer", "clamav")
 
 
 def reserved_names(*extra):
@@ -159,11 +160,11 @@ def reserved_names(*extra):
 
 
 def load_users(text, reserved=None):
-    """username,password,base_port[,games]. '#' comments. No commas in fields.
+    """username,password,base_port,games,disk. '#' comments. No commas in fields.
 
-    games is common or unique. Omitted means unique: the seat does not
-    mount /games or /gamessd. common uses the host paths from GAMES_HOST
-    and GAMESSD_HOST.
+    games is common or unique and is required. disk is hdd or ssd and is
+    required. It selects which persist root holds that login's home.
+    common mounts GAMES_HOST and GAMESSD_HOST. unique does not.
     """
     users = {}
     taken = []
@@ -173,12 +174,15 @@ def load_users(text, reserved=None):
         if not line or line.startswith("#"):
             continue
         parts = [p.strip() for p in line.split(",")]
-        if len(parts) not in (3, 4):
-            raise ValueError(f"{lineno}: want username,password,base_port[,games]")
-        name, password, base_s = parts[:3]
-        games = parts[3].lower() if len(parts) == 4 and parts[3] else "unique"
+        if len(parts) != 5:
+            raise ValueError(f"{lineno}: want username,password,base_port,games,disk")
+        name, password, base_s, games, disk = parts
+        games = games.lower()
+        disk = disk.lower()
         if games not in ("common", "unique"):
             raise ValueError(f"{lineno}: games must be common or unique")
+        if disk not in ("hdd", "ssd"):
+            raise ValueError(f"{lineno}: disk must be hdd or ssd")
         if not _ok_name(name, blocked):
             raise ValueError(f"{lineno}: bad username {name!r}")
         if not password or password.startswith("CHANGE_ME"):
@@ -193,7 +197,7 @@ def load_users(text, reserved=None):
             if not (hi < olo or lo > ohi):
                 raise ValueError(f"{lineno}: {name} {lo}-{hi} overlaps {other}")
         taken.append((lo, hi, name))
-        users[name] = User(name, password, base, games)
+        users[name] = User(name, password, base, games, disk)
     return users
 
 

@@ -375,6 +375,20 @@ def probe_failures(ready_timeout, period=2):
     return max(1, (ready + period - 1) // period)
 
 
+def user_home(cfg, user):
+    """Home host path. disk=hdd uses PERSIST_HDD_ROOT, disk=ssd uses the SSD root."""
+    disk = getattr(user, "disk", "")
+    if disk == "hdd":
+        root = getattr(cfg, "persist_hdd", "") or ""
+    elif disk == "ssd":
+        root = getattr(cfg, "persist_ssd", "") or cfg.persist_root
+    else:
+        raise ValueError(f"{user.name}: disk must be hdd or ssd")
+    if not root:
+        raise ValueError(f"{user.name}: no persist root for {disk}")
+    return root.rstrip("/") + "/" + user.name
+
+
 def kata_annotations(cfg, home, activity):
     """What the host shim reads. kernel_params is appended by Kata, and only
     if configuration-nvkvm.toml lists it in enable_annotations. The firmware
@@ -403,7 +417,7 @@ def kata_annotations(cfg, home, activity):
 
 
 def seat_pod(cfg, user, gpu, node=None):
-    home = cfg.persist_root.rstrip("/") + "/" + user.name
+    home = user_home(cfg, user)
     layer = cfg.layer_host or (cfg.persist_root.rstrip("/") + "/" + cfg.layer_dir)
     wayland = cfg.xdg_runtime.rstrip("/") + "/" + cfg.wayland_display
     node = node or cfg.node

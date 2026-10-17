@@ -14,18 +14,19 @@ Two longer references, if a step here is not enough: [nvkvm-kata.md](nvkvm-kata.
 - A filesystem you can mount at the same path on the orchestrator node and on every GPU node. NFS with `root_squash` will not work: the seat `chown`s the home directory to the desktop user.
 - `ctr` (or an equivalent) so you can import images on the nodes. The manifests use `imagePullPolicy: IfNotPresent` and the default names are local tags, not a registry.
 
-## 2. Shared disk
+## 2. Shared disks
 
-Pick the host path. The committed value is `/var/lib/gamestream/persistent`. If you change it, change `PERSIST_ROOT` in [deploy/gs-config.yaml](../deploy/gs-config.yaml) and `GS_PERSIST_ROOT` in step 5 so they are the same string.
+Pick two host paths. The committed values are `/var/lib/gamestream/hdd` and `/var/lib/gamestream/ssd`. If you change them, change `PERSIST_HDD_ROOT` and `PERSIST_SSD_ROOT` in [deploy/gs-config.yaml](../deploy/gs-config.yaml), and `GS_PERSIST_HDD` / `GS_PERSIST_SSD` in step 5, so they are the same strings. The SSD root holds the proxy store, the package layer, and the ClamAV database. A login's home is on the disk named in `users.csv`.
 
-On the shared filesystem, once:
+On the shared filesystems, once:
 
 ```bash
-install -d -m 0755 /var/lib/gamestream/persistent
-touch /var/lib/gamestream/persistent/.sunslop-volume
+install -d -m 0755 /var/lib/gamestream/hdd /var/lib/gamestream/ssd
+touch /var/lib/gamestream/hdd/.sunslop-volume
+touch /var/lib/gamestream/ssd/.sunslop-volume
 ```
 
-Mount that same filesystem at that same path on the node that will run `gs-orchestrator` and on every GPU node. `findmnt /var/lib/gamestream/persistent` on each of those nodes must show the same device. The orchestrator refuses to start when that directory is not a mount inside the pod, or when `.sunslop-volume` is missing. `DirectoryOrCreate` would otherwise create a private directory and a second certificate.
+Mount each filesystem at that same path on the node that will run `gs-orchestrator`, on the node that will run ClamAV, and on every GPU node. `findmnt` on each of those nodes must show the same device for each path. The orchestrator refuses to start when the SSD directory is not a mount inside the pod, or when `.sunslop-volume` is missing there. `DirectoryOrCreate` would otherwise create a private directory and a second certificate.
 
 `GS_PERSIST_ALLOW_UNMOUNTED=1` skips the check. It is for a local process on a workstation, not for this cluster.
 
@@ -39,7 +40,7 @@ Edit [deploy/gs-config.yaml](../deploy/gs-config.yaml):
 | `OVN_BACK_SUBNET` | The subnet the `default` namespace uses. Leave `ovn-default` if that is still it. |
 | `OVN_FRONT_NETWORK` | The client attachment. Leave `cs1-resident` if that NAD and subnet already have that name. |
 | `OVN_FRONT_NAD_NS` | Namespace of that NetworkAttachmentDefinition. `default` unless you put the NAD somewhere else. |
-| `PERSIST_ROOT` | The host path from step 2. |
+| `PERSIST_HDD_ROOT`, `PERSIST_SSD_ROOT` | The host paths from step 2. |
 | `ORCH_IMAGE`, `SEAT_IMAGE` | The tags you import in step 8, if not `gs-orchestrator:local` and `gamestream:local`. |
 | `GPU_COUNT` | How many GPUs each worker has. |
 | `SESSIONS_PER_GPU` | Seats per GPU. The orchestrator will not start one more than this. |
@@ -50,7 +51,7 @@ Leave the port offsets alone unless you also change the Sunshine build in the se
 
 Edit [deploy/orchestrator.yaml](../deploy/orchestrator.yaml):
 
-- `users.csv`: one line per login, `username,password,base_port[,games]`. The password is the Selkies login. `games` is `common` or `unique`. Omitted means `unique`. Usernames are lowercase, start with a letter, and are at most 40 characters. `common`, `gs-layer`, and `proxy` are not logins. With `CERT_PROXY=true` (the default) Moonlight does not use the port column; every client dials `SUNSHINE_BASE`. A `common` login mounts `GAMES_HOST` at `/games` and `GAMESSD_HOST` at `/gamessd`, both read-write. Those host paths are not taken from `PERSIST_ROOT`. A `unique` login does not mount them.
+- `users.csv`: one line per login, `username,password,base_port,games,disk`. The password is the Selkies login. `games` is `common` or `unique` and is required. `disk` is `hdd` or `ssd` and is required. It selects which persist root holds that home. Usernames are lowercase, start with a letter, and are at most 40 characters. `common`, `gs-layer`, `proxy`, and `clamav` are not logins. With `CERT_PROXY=true` (the default) Moonlight does not use the port column; every client dials `SUNSHINE_BASE`. A `common` login mounts `GAMES_HOST` at `/games` and `GAMESSD_HOST` at `/gamessd`, both read-write. Those host paths are not taken from either persist root. A `unique` login does not mount them.
 - `gs-cookie`: replace both strings. `cookie.secret` is the HMAC key for the browser cookie and for the proxy-to-orchestrator API, at least 16 bytes. `admin.password` is the `/admin` debug page password. An empty admin password is refused at startup, because `/admin` would be open on the node.
 
 ```bash
@@ -95,7 +96,7 @@ systemctl restart containerd
 
 ## 5. GPU node: shim, OVMF, Kata config
 
-Still on the GPU node. The paths have to match `KATA_FIRMWARE`, `KATA_FIRMWARE_VARS`, and `PERSIST_ROOT`.
+Still on the GPU node. The paths have to match `KATA_FIRMWARE`, `KATA_FIRMWARE_VARS`, `PERSIST_HDD_ROOT`, and `PERSIST_SSD_ROOT`.
 
 ```bash
 dnf install -y edk2-ovmf
@@ -111,18 +112,19 @@ path = "/usr/local/bin/gs-kata-shim"
 enable_annotations = ["default_vcpus", "default_memory", "firmware", "kernel_params"]
 ```
 
-Keep any annotation name that was already listed. If `valid_hypervisor_paths` is non-empty, add `/usr/local/bin/gs-kata-shim` to it. `kernel_params` is trusted: a pod on this RuntimeClass can name a directory under `GS_PERSIST_ROOT`. The orchestrator is the only thing that creates seat pods. Listing `firmware` without `kernel_params` leaves Kata on `-bios`, and the shim never sees the variable store.
+Keep any annotation name that was already listed. If `valid_hypervisor_paths` is non-empty, add `/usr/local/bin/gs-kata-shim` to it. `kernel_params` is trusted: a pod on this RuntimeClass can name a directory under either persist root. The orchestrator is the only thing that creates seat pods. Listing `firmware` without `kernel_params` leaves Kata on `-bios`, and the shim never sees the variable store.
 
 Append to `/etc/nvkvm-kata/shim.env` (do not remove the `NVKVM_*` lines the installer wrote):
 
 ```
-GS_PERSIST_ROOT=/var/lib/gamestream/persistent
+GS_PERSIST_HDD=/var/lib/gamestream/hdd
+GS_PERSIST_SSD=/var/lib/gamestream/ssd
 GS_UEFI_CODE=/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd
 GS_UEFI_TEMPLATE=/usr/share/edk2/ovmf/OVMF_VARS.fd
 NVKVM_SHIM=/opt/nvkvm-kata/bin/nvkvm-qemu-shim
 ```
 
-Use the empty `OVMF_VARS.fd`, not `OVMF_VARS.secboot.fd`. The secboot store enrolls Microsoft's keys and then will not boot this unsigned guest kernel. With the empty store, Secure Boot stays capable and off. The per-login copy is `<PERSIST_ROOT>/<login>/uefi/OVMF_VARS.fd`. The shim copies the template only when that file is missing. Deleting it returns the login to whatever the template is now.
+Use the empty `OVMF_VARS.fd`, not `OVMF_VARS.secboot.fd`. The secboot store enrolls Microsoft's keys and then will not boot this unsigned guest kernel. With the empty store, Secure Boot stays capable and off. The per-login copy is `<that login's disk>/<login>/uefi/OVMF_VARS.fd`. The shim copies the template only when that file is missing. Deleting it returns the login to whatever the template is now. A path is accepted only when it is under `GS_PERSIST_HDD` or `GS_PERSIST_SSD`.
 
 `KATA_FIRMWARE_VARS` and `GS_UEFI_TEMPLATE` are the same path. The pod does not pass the template. Only `shim.env` does.
 
@@ -207,7 +209,7 @@ kubectl -n "$NS" logs deploy/gs-orchestrator | head
 
 The orchestrator log line `persist: ...` is the mount it actually got. If a proxy stays Pending, the node is missing one of the two labels from step 7, or `cs1-resident` is not a NetworkAttachmentDefinition in `OVN_FRONT_NAD_NS`. A seat that starts on a different subnet than the proxy cannot be reached: both must be on `OVN_BACK_SUBNET`. If kube-ovn has already bound this namespace to some other subnet, add `${NAMESPACE}` to the back subnet's `spec.namespaces` and take it off the other one.
 
-`ORCH_REPLICAS` defaults to 1. Set it to 2 or 3 for a spare. The pods are `gs-orchestrator-0` and up, and the Service is headless so a proxy can reach any of them. Every orchestrator node has to mount `PERSIST_ROOT`. The board is Redis, image `REDIS_IMAGE` (`redis:7.4-alpine`), not a container built from this repo. `CACHE_REPLICAS` 1 is one pod. 3 is a primary and two replicas; Sentinel promotes a replica if the primary dies, and the keys stay. Redis does not use a disk. If every Redis pod restarts while the orchestrators are still up, the next pass lists the seat pods and waits one `ORCH_STALE_SECONDS` (15s) so every live orchestrator has checked in. The lowest ordinal then adopts the seats that no longer have an owner. A proxy keeps posting liveliness, so a seat that is still in use gets a new stamp and stays. A seat whose last stamp is already older than `IDLE_SECONDS` is deleted by that new owner. Proxies refuse a new session until the election is done. A session that already has a pod keeps working.
+`ORCH_REPLICAS` defaults to 1. Set it to 2 or 3 for a spare. The pods are `gs-orchestrator-0` and up, and the Service is headless so a proxy can reach any of them. Every orchestrator node has to mount `PERSIST_SSD_ROOT`. The orchestrator, proxy, Redis, and ClamAV pods set `runtimeClassName` to `KATA_RUNTIME` (`kata`). That RuntimeClass is upstream Kata, not `nvkvm-kata`, and it has to exist on every node that schedules one of those pods. Seats stay on `RUNTIME_CLASS`. The board is Redis, image `REDIS_IMAGE` (`redis:7.4-alpine`), not a container built from this repo. `CACHE_REPLICAS` 1 is one pod. 3 is a primary and two replicas; Sentinel promotes a replica if the primary dies, and the keys stay. Redis does not use a disk. If every Redis pod restarts while the orchestrators are still up, the next pass lists the seat pods and waits one `ORCH_STALE_SECONDS` (15s) so every live orchestrator has checked in. The lowest ordinal then adopts the seats that no longer have an owner. A proxy keeps posting liveliness, so a seat that is still in use gets a new stamp and stays. A seat whose last stamp is already older than `IDLE_SECONDS` is deleted by that new owner. Proxies refuse a new session until the election is done. A session that already has a pod keeps working.
 
 This apply replaces the RuntimeClass from step 6 and adds the node selector. That is what you want once the nodes are labeled.
 
@@ -253,7 +255,7 @@ kubectl -n gamestream get pod -l app=gs-proxy -o jsonpath='{range .items[*]}{.sp
 
 1. Sign in at `http://<front-address>:8080/pair` (or the Traefik URL on the back network) with the desktop password.
 2. In Moonlight, add the `cs1-resident` address of any proxy and start pairing. The PIN is on the client. The request waits up to 10 minutes. The node IP will not answer.
-3. Type those four digits on `/pair` next to that client. The certificate is stored for the signed-in login at `<PERSIST_ROOT>/proxy/store.json`. The public half is `<PERSIST_ROOT>/proxy/proxy-client.crt`. Every seat mounts that file and trusts it at boot. `/admin` shows whether each login's state file contains it. Several people can do this at once. Each PIN is applied only to the client that is showing it.
+3. Type those four digits on `/pair` next to that client. The certificate is stored for the signed-in login at `<PERSIST_SSD_ROOT>/proxy/store.json`. The public half is `<PERSIST_SSD_ROOT>/proxy/proxy-client.crt`. Every seat mounts that file and trusts it at boot. `/admin` shows whether each login's state file contains it. Several people can do this at the same time. Each PIN is applied only to the client that is showing it.
 4. Open the host in Moonlight. `applist` or launch is what creates the seat. A `serverinfo` poll does not. The seat's init container is the only writer of the shared package layer. The first one copies `/usr`, `/etc`, and `/opt` and may install RPMs, so the first connection can take most of `READY_TIMEOUT` (900 seconds). The desktop container then mounts `/usr` and `/opt` read-only and a private `/etc`. It has no `CAP_SYS_ADMIN`, so root in the seat cannot remount the layer. A `common` login also mounts `/games` and `/gamessd` read-write. A `unique` login does not. The pod is Ready when labwc's socket exists.
 5. An open Moonlight window keeps that seat up: the HTTPS `serverinfo` poll resets the idle timer. Closing Moonlight, with no browser session and no UDP, deletes the pod after `IDLE_SECONDS`. The home directory remains.
 
@@ -262,6 +264,6 @@ kubectl -n gamestream get pod -l app=gs-proxy -o jsonpath='{range .items[*]}{.sp
 - A second node is steps 4 through 7, the same images, and the same disk. Re-apply only if a manifest changed.
 - An NVIDIA driver upgrade needs `nvkvm-kata-gpu-cdi discover --force` from the nvkvm-kata checkout, then the gate again. Do not trust a label left over from the previous driver.
 - Deleting a seat pod is not a pause. The game process is gone. Files under the home directory are not. The shared layer is not. A seat cannot edit the layer: `/usr` and `/opt` are read-only, and the layer directory is not mounted in the desktop container. A `common` login can write `/games` and `/gamessd`. A `unique` login does not have those mounts. Other writable paths are the login's home and the tmpfs mounts `/tmp`, `/var/tmp`, `/var/log`, `/var/cache`, and `/run`.
-- Package changes go in `<PERSIST_ROOT>/<LAYER_DIR>/packages.list`, or in the image's `image/packages.list`. The next new seat's init container applies them. A running seat does not.
+- Package changes go in `<PERSIST_SSD_ROOT>/<LAYER_DIR>/packages.list`, or in the image's `image/packages.list`. The next new seat's init container applies them. A running seat does not. ClamAV does not scan that directory, or `proxy`, or `clamav`. It does scan homes on both disks and the common game paths. A hit is deleted and replaced by a `.threat.txt` file that names the signature. Unchanged size and mtime are not scanned again. `freshclam` updates the database on the SSD root.
 - The desktop container's extra capabilities are `SYS_NICE`, `IPC_LOCK`, and `SYS_RESOURCE`. Those raise rtprio, memlock, and nofile for the session. The game process does not hold them. `SYS_ADMIN` is only on the init container.
 - The orchestrator can `get`, `list`, `watch`, `create`, `delete`, and `patch` pods in this namespace, and read pod logs. The proxy has no kube token.

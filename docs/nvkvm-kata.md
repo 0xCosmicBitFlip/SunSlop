@@ -186,13 +186,14 @@ Keep every name that was already in `enable_annotations`. Add the shim to `valid
 `/etc/nvkvm-kata/shim.env` (the same file the nvkvm shim already reads):
 
 ```
-GS_PERSIST_ROOT=/var/lib/gamestream/persistent
+GS_PERSIST_HDD=/var/lib/gamestream/hdd
+GS_PERSIST_SSD=/var/lib/gamestream/ssd
 GS_UEFI_CODE=/usr/share/edk2/ovmf/OVMF_CODE.secboot.fd
 GS_UEFI_TEMPLATE=/usr/share/edk2/ovmf/OVMF_VARS.fd
 NVKVM_SHIM=/opt/nvkvm-kata/bin/nvkvm-qemu-shim
 ```
 
-`GS_PERSIST_ROOT` is the same string as `PERSIST_ROOT`. `GS_UEFI_CODE` and `GS_UEFI_TEMPLATE` are the same strings as `KATA_FIRMWARE` and `KATA_FIRMWARE_VARS`. Until you enroll a site key, the template has to be the empty variable store. `OVMF_VARS.secboot.fd` already has Microsoft's keys, and this guest kernel is not signed by them, so the VM would not boot.
+`GS_PERSIST_HDD` and `GS_PERSIST_SSD` are the same strings as `PERSIST_HDD_ROOT` and `PERSIST_SSD_ROOT`. `GS_UEFI_CODE` and `GS_UEFI_TEMPLATE` are the same strings as `KATA_FIRMWARE` and `KATA_FIRMWARE_VARS`. Until you enroll a site key, the template has to be the empty variable store. `OVMF_VARS.secboot.fd` already has Microsoft's keys, and this guest kernel is not signed by them, so the VM would not boot.
 
 Secure Boot that actually verifies the kernel is a separate step, [deploy/kata/secureboot.sh](../deploy/kata/secureboot.sh). It generates one self-signed cert for this site (not a key that ships in the repo), enrolls that cert as PK, KEK, and db, and turns Secure Boot on. That is custom mode: a PK is present, so the firmware is not in Setup Mode. `virt-fw-vars` (Fedora package `python3-virt-firmware`) writes the store. `sbsign` signs the EFI stub kernel. `scripts/sign-file` from the built kernel tree signs `nvkvm-guest.ko` with the same key. `--fragment` prints the `CONFIG_SYSTEM_TRUSTED_KEYS` lines to build into the guest; do not add `CONFIG_MODULE_SIG_FORCE` until that module is signed, or the GPU device will not load.
 

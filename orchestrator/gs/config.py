@@ -87,6 +87,8 @@ class Config:
     gamessd_host: str = ""
     games_mount: str = "/games"
     gamessd_mount: str = "/gamessd"
+    persist_hdd: str = ""
+    persist_ssd: str = ""
 
 
 def env_get(name, default):
@@ -129,9 +131,11 @@ def _dir_name(value, label):
 
 def derive_storage(persist_root, common_dir, layer_dir, proxy_dir, persist_mount,
                    common_host="", layer_host="", proxy_store="", cert_file="proxy-client.crt"):
-    """Host homes are <root>/<login>. The three shared dirs sit beside them.
+    """Infrastructure lives on the SSD root passed as persist_root.
+
     The proxy file is <persist_mount>/<proxy_dir>/store.json inside the proxy.
-    The public cert is the sibling file seats mount read-only.
+    The public cert is the sibling file seats mount read-only. Homes are not
+    derived here; the login's disk column picks the HDD or SSD root.
     """
     root = persist_root.rstrip("/")
     mount = persist_mount.rstrip("/")
@@ -156,7 +160,11 @@ def load_config():
             "An empty password would leave /admin open on the proxy."
         )
     flag = env_get("CERT_PROXY", "true").lower()
-    persist_root = env_get("PERSIST_ROOT", "/var/lib/gamestream/persistent")
+    persist_ssd = env_get("PERSIST_SSD_ROOT", "/var/lib/gamestream/ssd").rstrip("/")
+    persist_hdd = env_get("PERSIST_HDD_ROOT", "/var/lib/gamestream/hdd").rstrip("/")
+    if persist_ssd == persist_hdd:
+        raise SystemExit("PERSIST_HDD_ROOT and PERSIST_SSD_ROOT are the same path")
+    persist_root = persist_ssd
     common_dir = _dir_name(env_get("COMMON_DIR", "common"), "COMMON_DIR")
     layer_dir = _dir_name(env_get("LAYER_DIR", "gs-layer"), "LAYER_DIR")
     proxy_dir = _dir_name(env_get("PROXY_DIR", "proxy"), "PROXY_DIR")
@@ -227,7 +235,9 @@ def load_config():
         secret=secret,
         cookie_ttl=env_int("COOKIE_TTL", 30 * 24 * 3600),
         idle_seconds=env_int("IDLE_SECONDS", 600),
-        persist_root=persist_root.rstrip("/"),
+        persist_root=persist_root,
+        persist_hdd=persist_hdd,
+        persist_ssd=persist_ssd,
         common_host=common_host,
         common_mount=common_mount,
         image=env_get("SEAT_IMAGE", "gamestream:local"),
@@ -336,13 +346,13 @@ def require_persist_mount(path):
         raise SystemExit(
             f"{path} is not a mount. Refusing to start, because a local directory "
             "would mint a second certificate. The pod must mount the shared "
-            "PERSIST_ROOT at this path. GS_PERSIST_ALLOW_UNMOUNTED=1 is only for a local run."
+            "PERSIST_SSD_ROOT at this path. GS_PERSIST_ALLOW_UNMOUNTED=1 is only for a local run."
         )
     marker = os.path.join(real, ".sunslop-volume")
     if not os.path.isfile(marker):
         raise SystemExit(
             f"{marker} is missing. On the shared filesystem, run "
-            "`touch <PERSIST_ROOT>/.sunslop-volume` once, and confirm every "
+            "`touch <PERSIST_SSD_ROOT>/.sunslop-volume` once, and confirm every "
             "proxy node and the orchestrator node see that same file. "
             "A node-local directory would mint a second certificate."
         )

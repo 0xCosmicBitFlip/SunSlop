@@ -16,7 +16,7 @@ metadata:
     io.katacontainers.config.hypervisor.default_vcpus: "${SEAT_CPU_LIMIT}"
     io.katacontainers.config.hypervisor.default_memory: "${KATA_MEMORY_MIB}"
     io.katacontainers.config.hypervisor.firmware: ${KATA_FIRMWARE}
-    io.katacontainers.config.hypervisor.kernel_params: "sunslop.uefi_vars=${PERSIST_ROOT}/${SEAT_DIRECT_USER}/uefi/OVMF_VARS.fd sunslop.uefi_code=${KATA_FIRMWARE} sunslop.tpu_state=${PERSIST_ROOT}/${SEAT_DIRECT_USER}/${TPU_STATE_DIR}"
+    io.katacontainers.config.hypervisor.kernel_params: "sunslop.uefi_vars=${SEAT_HOME_HOST}/uefi/OVMF_VARS.fd sunslop.uefi_code=${KATA_FIRMWARE} sunslop.tpu_state=${SEAT_HOME_HOST}/${TPU_STATE_DIR}"
 spec:
   restartPolicy: Never
   runtimeClassName: ${RUNTIME_CLASS}
@@ -166,11 +166,11 @@ ${GAMES_MOUNTS}        - name: pod-etc
   volumes:
     - name: home
       hostPath:
-        path: ${PERSIST_ROOT}/${SEAT_DIRECT_USER}
+        path: ${SEAT_HOME_HOST}
         type: DirectoryOrCreate
 ${GAMES_VOLUMES}    - name: layer
       hostPath:
-        path: ${PERSIST_ROOT}/${LAYER_DIR}
+        path: ${PERSIST_SSD_ROOT}/${LAYER_DIR}
         type: DirectoryOrCreate
     - name: pod-etc
       emptyDir: {}
@@ -196,5 +196,5 @@ ${GAMES_VOLUMES}    - name: layer
         sizeLimit: 1Gi
     - name: proxy-cert
       hostPath:
-        path: ${PERSIST_ROOT}/${PROXY_DIR}/${PROXY_CLIENT_CERT}
+        path: ${PERSIST_SSD_ROOT}/${PROXY_DIR}/${PROXY_CLIENT_CERT}
         type: FileOrCreate

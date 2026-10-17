@@ -1,0 +1,88 @@
+# One ClamAV pod. Stock clamav/clamav, not an image built from this repo.
+# Runtime is KATA_RUNTIME (upstream Kata), not the GPU runtime.
+#
+# It mounts both persist roots and, when set, the common game libraries.
+# Homes are the login directories on those roots. gs-layer, proxy, and
+# clamav on the SSD root are not scanned. The signature database and the
+# size/mtime cache stay on the SSD root. freshclam updates the database
+# on a timer. A file is scanned again only when its size or mtime changes.
+# A hit is deleted and replaced by <name>.threat.txt naming the signature.
+#
+# The node that runs this pod must have both persist roots mounted at the
+# same paths as the GPU nodes. Apply with the other manifests.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gs-clamav
+  namespace: ${NAMESPACE}
+data:
+  scan.sh: |
+##CLAMAV_SCRIPT##
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gs-clamav
+  namespace: ${NAMESPACE}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gs-clamav
+  template:
+    metadata:
+      labels:
+        app: gs-clamav
+      annotations:
+        ovn.kubernetes.io/logical_switch: ${OVN_BACK_SUBNET}
+    spec:
+      runtimeClassName: ${KATA_RUNTIME}
+      containers:
+        - name: clamav
+          image: ${CLAMAV_IMAGE}
+          imagePullPolicy: IfNotPresent
+          command: ["bash", "/scan.sh"]
+          env:
+            - name: CLAMAV_STATE
+              value: /state/seen.tsv
+            - name: CLAMAV_SCAN_SECONDS
+              value: "${CLAMAV_SCAN_SECONDS}"
+            - name: CLAMAV_UPDATE_SECONDS
+              value: "${CLAMAV_UPDATE_SECONDS}"
+            - name: CLAMAV_SKIP
+              value: "${LAYER_DIR},proxy,clamav"
+            - name: CLAMAV_ROOTS
+              value: "/scan/hdd /scan/ssd /scan/games /scan/gamessd"
+          volumeMounts:
+            - name: script
+              mountPath: /scan.sh
+              subPath: scan.sh
+            - name: hdd
+              mountPath: /scan/hdd
+            - name: ssd
+              mountPath: /scan/ssd
+            - name: db
+              mountPath: /var/lib/clamav
+            - name: state
+              mountPath: /state
+${CLAMAV_MOUNTS}      volumes:
+        - name: script
+          configMap:
+            name: gs-clamav
+        - name: hdd
+          hostPath:
+            path: ${PERSIST_HDD_ROOT}
+            type: DirectoryOrCreate
+        - name: ssd
+          hostPath:
+            path: ${PERSIST_SSD_ROOT}
+            type: DirectoryOrCreate
+        - name: db
+          hostPath:
+            path: ${PERSIST_SSD_ROOT}/clamav/db
+            type: DirectoryOrCreate
+        - name: state
+          hostPath:
+            path: ${PERSIST_SSD_ROOT}/clamav/state
+            type: DirectoryOrCreate
+${CLAMAV_VOLUMES}

@@ -34,50 +34,52 @@ def self_test():
     cache_test()
     board_test()
     users = load_users(
-        "# c\ngsuser0,secret,47989\ngsuser1,other,48089,unique\n"
+        "# c\ngsuser0,secret,47989,unique,ssd\ngsuser1,other,48089,unique,hdd\n"
     )
     assert set(users) == {"gsuser0", "gsuser1"}
     assert users["gsuser0"].games == "unique"
-    assert users["gsuser1"].games == "unique"
+    assert users["gsuser0"].disk == "ssd"
+    assert users["gsuser1"].disk == "hdd"
     assert list(port_span(47989))[0] == 47984
     assert list(port_span(47989))[-1] == 48010
     assert len(list(port_span(47989))) == SPAN
     try:
-        load_users("gsuser0,a,47989\ngsuser1,b,48000\n")
+        load_users("gsuser0,a,47989,unique,ssd\ngsuser1,b,48000,unique,ssd\n")
         raise SystemExit("overlap accepted")
     except ValueError:
         pass
     try:
-        load_users("common,a,47989\n")
+        load_users("common,a,47989,unique,ssd\n")
         raise SystemExit("common accepted")
     except ValueError:
         pass
     try:
-        load_users("proxy,a,47989\n")
+        load_users("proxy,a,47989,unique,ssd\n")
         raise SystemExit("proxy accepted")
     except ValueError:
         pass
     try:
-        load_users("gs-layer,a,47989\n")
+        load_users("gs-layer,a,47989,unique,ssd\n")
         raise SystemExit("gs-layer accepted")
     except ValueError:
         pass
     try:
-        load_users("library,a,47989\n", reserved_names("library"))
+        load_users("library,a,47989,unique,ssd\n", reserved_names("library"))
         raise SystemExit("configured dir accepted as a login")
     except ValueError:
         pass
     try:
-        load_users("gsuser0,CHANGE_ME_selkies_password,47989\n")
+        load_users("gsuser0,CHANGE_ME_selkies_password,47989,unique,ssd\n")
         raise SystemExit("placeholder password accepted")
     except ValueError:
         pass
     try:
-        load_users("gsuser0,secret,47989,shared\n")
+        load_users("gsuser0,secret,47989,shared,ssd\n")
         raise SystemExit("bad games mode accepted")
     except ValueError:
         pass
-    marked = load_users("gsuser0,secret,47989,common\ngsuser1,other,48089\n")
+    marked = load_users("gsuser0,secret,47989,common,hdd\ngsuser1,other,48089,unique,ssd\n")
+    assert marked["gsuser0"].disk == "hdd"
     assert marked["gsuser0"].games == "common"
     assert probe_failures(900) == 450
     assert probe_failures(901) == 451
@@ -98,6 +100,7 @@ def self_test():
     cfg = Config(
         node="n1", namespace="ns", users_file="", secret=secret, cookie_ttl=10,
         idle_seconds=600, persist_root="/data/persist",
+        persist_hdd="/data/hdd", persist_ssd="/data/persist",
         common_host="/data/persist/common",
         common_mount="/games", image="gamestream:local", runtime="nvkvm-kata",
         gpu_count=2, sessions_per_gpu=8, http_port=8080, selkies_port=8082,
@@ -117,7 +120,7 @@ def self_test():
         "/var/lib/gamestream/persistent", "common", "gs-layer", "proxy", "/var/lib/gs-persist"
     )[0]
     pod = seat_pod(cfg, users["gsuser0"], 1)
-    assert pod["spec"]["volumes"][0]["hostPath"]["path"].endswith("/gsuser0")
+    assert pod["spec"]["volumes"][0]["hostPath"]["path"] == "/data/persist/gsuser0"
     assert pod["spec"]["volumes"][1]["hostPath"]["path"].endswith("/gs-layer")
     assert pod["spec"]["nodeName"] == "n1"
     assert pod["metadata"]["labels"]["gamestream.local/gpu"] == "1"
@@ -180,6 +183,7 @@ def self_test():
     custom = Config(
         node="n1", namespace="ns", users_file="", secret=secret, cookie_ttl=10,
         idle_seconds=600, persist_root="/data/persist",
+        persist_hdd="/data/hdd", persist_ssd="/data/persist",
         common_host="/data/persist/library",
         common_mount="/library", image="seat:custom", runtime="kata-custom",
         gpu_count=2, sessions_per_gpu=8, http_port=8080, selkies_port=9090,
@@ -205,7 +209,10 @@ def self_test():
     assert pod["spec"]["containers"][0]["resources"]["requests"]["memory"] == "4Gi"
     cfg.games_host = "/mnt/library"
     cfg.gamessd_host = "/mnt/fast"
+    cfg.persist_hdd = "/data/hdd"
+    cfg.persist_ssd = "/data/persist"
     shared = seat_pod(cfg, marked["gsuser0"], 1)
+    assert shared["spec"]["volumes"][0]["hostPath"]["path"] == "/data/hdd/gsuser0"
     sm = {item["mountPath"]: item for item in shared["spec"]["containers"][0]["volumeMounts"]}
     assert sm["/games"].get("readOnly") is not True
     assert sm["/gamessd"].get("readOnly") is not True
@@ -248,7 +255,7 @@ def _component_test():
     """Proxy API, placement, Selkies login, and the foreign-seat redirect."""
     import tempfile
     users_file = os.path.join(tempfile.mkdtemp(), "users.csv")
-    open(users_file, "w").write("gsuser0,secret,47989\ngsuser1,other,48089\n")
+    open(users_file, "w").write("gsuser0,secret,47989,unique,ssd\ngsuser1,other,48089,unique,hdd\n")
     directory = Directory(users_file, reserved_names("common", "gs-layer", "proxy"))
     secret = b"0123456789abcdef"
 
@@ -309,6 +316,7 @@ def _component_test():
     cfg = Config(
         node="orch", namespace="gamestream", users_file=users_file, secret=secret,
         cookie_ttl=100, idle_seconds=600, persist_root="/data/persist",
+        persist_hdd="/data/hdd", persist_ssd="/data/persist",
         common_host="/data/persist/common", common_mount="/games",
         image="gamestream:local", runtime="nvkvm-kata", gpu_count=2,
         sessions_per_gpu=8, http_port=api_port, selkies_port=8082,
@@ -356,6 +364,7 @@ def _component_test():
     proxy_cfg = Config(
         node="node-a", namespace="gamestream", users_file=users_file, secret=secret,
         cookie_ttl=100, idle_seconds=600, persist_root="/data/persist",
+        persist_hdd="/data/hdd", persist_ssd="/data/persist",
         common_host="/data/persist/common", common_mount="/games",
         image="gamestream:local", runtime="nvkvm-kata", gpu_count=2,
         sessions_per_gpu=8, http_port=api_port, selkies_port=8082,
@@ -434,6 +443,7 @@ def _component_test():
     web_cfg = Config(
         node="node-a", namespace="gamestream", users_file=users_file, secret=secret,
         cookie_ttl=100, idle_seconds=600, persist_root="/data/persist",
+        persist_hdd="/data/hdd", persist_ssd="/data/persist",
         common_host="/data/persist/common", common_mount="/games",
         image="gamestream:local", runtime="nvkvm-kata", gpu_count=2,
         sessions_per_gpu=8, http_port=web_port, selkies_port=echo_box["port"],

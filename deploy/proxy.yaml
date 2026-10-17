@@ -59,6 +59,7 @@ spec:
         k8s.v1.cni.cncf.io/networks: ${OVN_FRONT_NAD_NS}/${OVN_FRONT_NETWORK}
         ${OVN_FRONT_NETWORK}.${OVN_FRONT_NAD_NS}.ovn.kubernetes.io/logical_switch: ${OVN_FRONT_NETWORK}
     spec:
+      runtimeClassName: ${KATA_RUNTIME}
       serviceAccountName: ${PROXY_NAME}
       automountServiceAccountToken: false
       nodeSelector:
@@ -129,5 +130,5 @@ spec:
             secretName: gs-cookie
         - name: persist
           hostPath:
-            path: ${PERSIST_ROOT}
+            path: ${PERSIST_SSD_ROOT}
             type: DirectoryOrCreate

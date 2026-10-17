@@ -44,8 +44,8 @@ def load_config(path):
             raise SystemExit(f"{path}: cannot parse {raw!r}")
         value = next(group for group in match.groups()[1:] if group is not None)
         data[match.group(1)] = value
-    if "NAMESPACE" not in data or "PERSIST_ROOT" not in data:
-        raise SystemExit(f"{path}: missing NAMESPACE or PERSIST_ROOT")
+    if "NAMESPACE" not in data or "PERSIST_SSD_ROOT" not in data or "PERSIST_HDD_ROOT" not in data:
+        raise SystemExit(f"{path}: missing NAMESPACE, PERSIST_HDD_ROOT, or PERSIST_SSD_ROOT")
     return data
 
 
@@ -85,9 +85,9 @@ def derive(values):
     return values
 
 
-def csv_modes(orch_text):
-    """games column from the users.csv block. Missing column is unique."""
-    modes = {}
+def csv_rows(orch_text):
+    """games and disk columns. Both are required."""
+    rows = {}
     in_csv = False
     for line in orch_text.splitlines():
         if not in_csv:
@@ -100,11 +100,15 @@ def csv_modes(orch_text):
         if not raw or raw.startswith("#"):
             continue
         parts = [part.strip() for part in raw.split(",")]
-        if len(parts) < 3 or not parts[0] or parts[0].startswith("$"):
+        if not parts[0] or parts[0].startswith("$"):
             continue
-        mode = parts[3].lower() if len(parts) >= 4 and parts[3] else "unique"
-        modes[parts[0]] = mode
-    return modes
+        if len(parts) != 5:
+            raise SystemExit(f"users.csv {parts[0]}: want username,password,base_port,games,disk")
+        games, disk = parts[3].lower(), parts[4].lower()
+        if games not in ("common", "unique") or disk not in ("hdd", "ssd"):
+            raise SystemExit(f"users.csv {parts[0]}: games is common or unique, disk is hdd or ssd")
+        rows[parts[0]] = {"games": games, "disk": disk}
+    return rows
 
 
 def games_blocks(mode, host, ssd_host, mount, ssd_mount):
@@ -139,15 +143,18 @@ def games_blocks(mode, host, ssd_host, mount, ssd_mount):
 
 
 def apply_games(values, orch_text):
-    modes = csv_modes(orch_text)
-    bad = sorted(user for user, mode in modes.items() if mode not in ("common", "unique"))
-    if bad:
-        raise SystemExit("users.csv games column must be common or unique: " + ", ".join(bad))
-    if any(mode == "common" for mode in modes.values()):
+    rows = csv_rows(orch_text)
+    if any(row["games"] == "common" for row in rows.values()):
         if not values.get("GAMES_HOST") or not values.get("GAMESSD_HOST"):
             raise SystemExit("a user is common but GAMES_HOST or GAMESSD_HOST is empty")
     user = values.get("SEAT_DIRECT_USER", "")
-    mode = modes.get(user, "unique")
+    row = rows.get(user) if user else None
+    if user and row is None:
+        raise SystemExit(f"{user} is not in users.csv")
+    mode = row["games"] if row else "unique"
+    disk = row["disk"] if row else "ssd"
+    root = values["PERSIST_HDD_ROOT"] if disk == "hdd" else values["PERSIST_SSD_ROOT"]
+    values["SEAT_HOME_HOST"] = f"{root}/{user}" if user else ""
     values.update(games_blocks(
         mode,
         values.get("GAMES_HOST", ""),
@@ -155,10 +162,47 @@ def apply_games(values, orch_text):
         values.get("GAMES_MOUNT", "/games"),
         values.get("GAMESSD_MOUNT", "/gamessd"),
     ))
+    mounts = []
+    volumes = []
+    for name, key, dest in (
+        ("games", "GAMES_HOST", "/scan/games"),
+        ("gamessd", "GAMESSD_HOST", "/scan/gamessd"),
+    ):
+        host = values.get(key, "")
+        if not host:
+            continue
+        mounts.append(f"            - name: {name}\n              mountPath: {dest}\n")
+        volumes.append(
+            f"        - name: {name}\n"
+            "          hostPath:\n"
+            f"            path: {host}\n"
+            "          type: DirectoryOrCreate\n"
+        )
+    values["CLAMAV_MOUNTS"] = "".join(mounts)
+    values["CLAMAV_VOLUMES"] = "".join(volumes)
     return values
 
 
 def fill(text, values, path):
+    missing = sorted(set(PLACE.findall(text)) - set(values))
+    if missing:
+        raise SystemExit(f"{path}: no value for {', '.join(missing)}")
+
+    def repl(match):
+        return values[match.group(1)]
+
+    return PLACE.sub(repl, text)
+
+
+def render_text(path, values):
+    raw = path.read_text()
+    if path.name == "clamav.yaml":
+        script = (HERE / "clamav-scan.sh").read_text().rstrip("\n")
+        indented = "\n".join(("    " + line) if line else "" for line in script.split("\n"))
+        if "##CLAMAV_SCRIPT##" not in raw:
+            raise SystemExit("clamav.yaml is missing the script marker")
+        raw = raw.replace("##CLAMAV_SCRIPT##", indented)
+    return fill(raw, values, path)
     missing = sorted(set(PLACE.findall(text)) - set(values))
     if missing:
         raise SystemExit(f"{path}: no value for {', '.join(missing)}")
@@ -187,8 +231,15 @@ def main(argv):
         apply_games(values, (HERE / "orchestrator.yaml").read_text())
         assert values["SEAT_PROBE_FAILURES"] == "450", values["SEAT_PROBE_FAILURES"]
         assert values["GAMES_ENV"] == ""
-        modes = csv_modes("  users.csv: |\n    alice,pw,1,common\n    bob,pw,2\n")
-        assert modes == {"alice": "common", "bob": "unique"}
+        rows = csv_rows("  users.csv: |\n    alice,pw,1,common,hdd\n    bob,pw,2,unique,ssd\n")
+        assert rows["alice"] == {"games": "common", "disk": "hdd"}
+        assert rows["bob"]["disk"] == "ssd"
+        try:
+            csv_rows("  users.csv: |\n    alice,pw,1,common\n")
+            raise SystemExit("short users.csv row accepted")
+        except SystemExit as exc:
+            if "games,disk" not in str(exc):
+                raise
         blocks = games_blocks("common", "/mnt/library", "/mnt/fast", "/games", "/gamessd")
         assert "readOnly" not in blocks["GAMES_MOUNTS"]
         assert "path: /mnt/fast" in blocks["GAMES_VOLUMES"]
@@ -199,24 +250,34 @@ def main(argv):
         except SystemExit as exc:
             if "GAMES_HOST" not in str(exc):
                 raise
-        proxy = fill((HERE / "proxy.yaml").read_text(), values, HERE / "proxy.yaml")
+        proxy = render_text(HERE / "proxy.yaml", values)
         assert "hostNetwork:" not in proxy
         assert "hostPort:" not in proxy
         assert "k8s.v1.cni.cncf.io/networks: default/cs1-resident" in proxy
         assert "ovn.kubernetes.io/logical_switch: ovn-default" in proxy
         assert "cs1-resident.default.ovn.kubernetes.io/logical_switch: cs1-resident" in proxy
-        orch = fill((HERE / "orchestrator.yaml").read_text(), values, HERE / "orchestrator.yaml")
+        orch = render_text(HERE / "orchestrator.yaml", values)
         assert "kind: StatefulSet" in orch
         assert "clusterIP: None" in orch
-        cache = fill((HERE / "cache.yaml").read_text(), values, HERE / "cache.yaml")
+        cache = render_text(HERE / "cache.yaml", values)
         assert "clusterIP: None" in cache
         assert "redis:7.4-alpine" in cache
         assert "redis-sentinel" in cache
-        seat = fill((HERE / "seat-direct.yaml").read_text(), values, HERE / "seat-direct.yaml")
+        seat = render_text(HERE / "seat-direct.yaml", values)
         assert "ovn.kubernetes.io/logical_switch: ovn-default" in seat
         assert "cs1-resident" not in seat
         assert "name: games" not in seat
         assert "name: gamessd" not in seat
+        assert values["SEAT_HOME_HOST"].endswith("/gsuser0")
+        clam = render_text(HERE / "clamav.yaml", values)
+        assert "runtimeClassName: kata" in orch
+        assert "runtimeClassName: kata" in proxy
+        assert "runtimeClassName: kata" in cache
+        assert "runtimeClassName: kata" in clam
+        assert "clamscan" in clam
+        assert "/scan/hdd" in clam
+        assert "gs-layer" not in clam.split("scan.sh:", 1)[-1].split("---", 1)[0] or "CLAMAV_SKIP" in clam
+        assert "##CLAMAV_SCRIPT##" not in clam
         sample = (HERE / "orchestrator.yaml").read_text()
         assert placeholder_lines(sample), "sample manifest has no CHANGE_ME secrets"
         assert not placeholder_lines("# CHANGE_ME in a comment\nkey: value\n")
@@ -224,7 +285,7 @@ def main(argv):
         return 0
     values = derive(load_config(HERE / "gs-config.yaml"))
     apply_games(values, (HERE / "orchestrator.yaml").read_text())
-    names = ["gs-config.yaml", "orchestrator.yaml", "cache.yaml", "proxy.yaml"]
+    names = ["gs-config.yaml", "orchestrator.yaml", "cache.yaml", "proxy.yaml", "clamav.yaml"]
     if "--time-slicing" in argv:
         names.append("time-slicing.yaml")
     if "--seat" in argv:
@@ -232,7 +293,7 @@ def main(argv):
     parts = []
     for name in names:
         path = HERE / name
-        parts.append(fill(path.read_text(), values, path).strip())
+        parts.append(render_text(path, values).strip())
     rendered = "\n---\n".join(parts) + "\n"
     if "--allow-placeholders" not in argv:
         found = placeholder_lines(rendered)
